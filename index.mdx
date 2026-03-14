@@ -1,0 +1,208 @@
+---
+title: "Embedded Rust with RP2040"
+description: "Program the Raspberry Pi Pico in Rust using the rp2040-hal and Embassy async framework. Nine lessons covering toolchain setup, ownership-driven hardware access, timers, PWM, I2C sensors, OLED displays, async tasks, wireless networking, and a multi-sensor data logger project. Each lesson builds a real project."
+pubDate: 2026-03-04
+tags: ["rust", "rp2040", "embedded-rust", "raspberry-pi-pico", "embassy", "probe-rs", "embedded-hal", "async", "typestate"]
+excerpt: "Master embedded Rust on the RP2040 from first blink to async wireless firmware. Learn how Rust's ownership model prevents hardware bugs at compile time, use the Embassy async executor for concurrent tasks without an OS, and build real projects including sensor dashboards, servo controllers, GPS loggers, and Wi-Fi connected devices."
+heroImage: "https://cdn.siliconwit.com/education/embedded-rust-rp2040/embedded-rust-rp2040.jpg"
+---
+
+import Copyright from '../../../../components/Copyright.astro';
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import { Card, CardGrid, Badge, Steps } from '@astrojs/starlight/components';
+
+Rust is gaining serious traction in embedded systems, and for good reason. The compiler catches entire categories of firmware bugs (dangling pointers, data races, use-after-free, double peripheral initialization) before your code ever reaches the chip. This course teaches you to write embedded Rust on the Raspberry Pi Pico, starting with the rp2040-hal crate for direct hardware control and progressing to the Embassy async framework for concurrent firmware without an RTOS. Every lesson builds a real, working project on actual hardware. #EmbeddedRust #RP2040 #RaspberryPiPico
+
+Keep the [RP2040 Datasheet](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf) and the [rp2040-hal documentation](https://docs.rs/rp2040-hal/latest/rp2040_hal/) open as you work through this course. The [Raspberry Pi Pico Datasheet](https://datasheets.raspberrypi.com/pico/pico-datasheet.pdf) covers pinout, power supply, and mechanical drawings. For Embassy, the [Embassy documentation](https://embassy.dev/book/) is your async runtime reference.
+
+## Two Audiences, One Course
+
+This course serves two groups of engineers:
+
+<CardGrid>
+  <Card title="C Embedded Engineers Learning Rust" icon="star">
+    You already know registers, interrupts, DMA, and linker scripts. You want to understand what Rust actually gives you over C in firmware. Each lesson includes a "C vs Rust" sidebar that maps familiar C patterns to their Rust equivalents, so the transition is concrete rather than abstract.
+  </Card>
+
+  <Card title="Rust Developers Entering Embedded" icon="approve-check">
+    You know ownership, traits, and lifetimes from application Rust. You want to apply those skills to microcontrollers. Each lesson explains the hardware concepts (registers, peripherals, interrupts) alongside the Rust code that drives them, so you build embedded intuition as you go.
+  </Card>
+</CardGrid>
+
+## Why Rust for Embedded
+
+<CardGrid>
+  <Card title="Typestate Safety" icon="approve-check">
+    Rust HALs encode hardware state in the type system. A GPIO pin configured as an input has a different type than the same pin configured as an output. Try to write to an input pin and the compiler rejects your code. Try to read an ADC channel before configuring the ADC and the code does not compile. This is not runtime error checking; it is compile-time proof of correctness.
+  </Card>
+
+  <Card title="Ownership-Driven Peripherals" icon="setting">
+    Each peripheral is a singleton that can only be owned by one part of your code at a time. No more wondering which module touched the SPI bus last. No more accidental double initialization. The borrow checker enforces exclusive access to hardware the same way it enforces exclusive access to memory.
+  </Card>
+
+  <Card title="Async Without an OS" icon="rocket">
+    Embassy provides cooperative async/await on bare-metal Cortex-M0+. You write firmware that looks like multiple concurrent tasks (read sensor, update display, handle buttons) without the RAM overhead of an RTOS. The executor is interrupt-driven, so idle tasks cost zero CPU cycles.
+  </Card>
+
+  <Card title="embedded-hal Portability" icon="open-book">
+    Drivers written against the embedded-hal traits work across any microcontroller. An SSD1306 OLED driver written for STM32 works on RP2040 with zero changes. Your driver code becomes portable while your HAL layer handles chip-specific details.
+  </Card>
+</CardGrid>
+
+## Production Adoption
+
+Rust in embedded is not experimental. Production deployments include:
+
+| Company | Application |
+|---------|-------------|
+| Volvo | In-vehicle infotainment low-level firmware |
+| Microsoft | Surface firmware components |
+| Framework Laptop | Embedded controller firmware (open-source, Rust) |
+| Toyota (Woven Planet) | Vehicle platform safety-critical subsystems |
+| ST Microelectronics | Official Rust support for STM32 (embassy-stm32) |
+| Espressif | Official Rust toolchain for ESP32 (esp-hal) |
+| Oxide Computer | Server BMC firmware, entirely in Rust (Hubris RTOS) |
+
+The embedded Rust ecosystem is mature enough for production use, and growing rapidly. Learning it now positions you for the industry direction.
+
+## Course Structure
+
+Each lesson follows a consistent cycle:
+
+<Steps>
+1. **The Project**
+   A real, useful thing to build. The project drives which Rust concepts and peripherals you need.
+
+2. **Rust Concepts in Context**
+   Ownership, borrowing, typestate, traits, or async patterns explained through the hardware problem at hand. Not abstract theory; concrete firmware.
+
+3. **Implementation**
+   Write the firmware using rp2040-hal (Lessons 1 through 5) or Embassy (Lessons 6 through 9). Full working code with explanations.
+
+4. **C vs Rust Sidebar**
+   How you would solve the same problem in C, and what the Rust version catches at compile time that C catches at debug time (or never).
+
+5. **Build, Flash, and Test**
+   Flash with probe-rs, view defmt logs over RTT, and verify the project works on real hardware.
+</Steps>
+
+## Lessons
+
+<CardGrid>
+  <Card title="Lesson 1: Rust Toolchain and First Blink" icon="star">
+    [Rust Toolchain and First Blink](./rust-toolchain-first-blink). Install Rust, probe-rs, and flip-link. Create your first rp2040 project with Cargo, understand Cargo.toml dependencies, memory.x, and .cargo/config.toml. Build a blinking LED with defmt logging over RTT.
+    **Build:** Blinking LED with RTT logging. **Parts:** Raspberry Pi Pico, debug probe, LED, resistor.
+  </Card>
+
+  <Card title="Lesson 2: Ownership, Borrowing, and Hardware" icon="document">
+    [Ownership, Borrowing, and Hardware](./ownership-borrowing-hardware). Learn how Rust's ownership model maps to hardware peripherals. Typestate GPIO, button debouncing with owned state, error handling with Result, and safe access to shared resources with Mutex and critical sections.
+    **Build:** Button-toggled LED with debounce. **Parts:** Push button, LED, resistors.
+  </Card>
+
+  <Card title="Lesson 3: Timers, PWM, and Interrupts" icon="document">
+    [Timers, PWM, and Interrupts](./timers-pwm-interrupts). Configure RP2040 timers, generate servo PWM, handle interrupts with the critical-section crate, and read analog inputs. Build a pot-controlled servo with buzzer feedback.
+    **Build:** Potentiometer-controlled servo with buzzer. **Parts:** SG90 servo, potentiometer, piezo buzzer.
+  </Card>
+
+  <Card title="Lesson 4: I2C, SPI, and embedded-hal Drivers" icon="document">
+    [I2C, SPI, and embedded-hal Drivers](./i2c-spi-embedded-hal). Use embedded-hal traits to interface a BME280 sensor over I2C and an SSD1306 OLED over I2C/SPI. Understand how trait-based drivers enable cross-platform portability.
+    **Build:** Environmental sensor dashboard on OLED. **Parts:** BME280, SSD1306 OLED.
+  </Card>
+
+  <Card title="Lesson 5: UART, DMA, and292Data Pipelines" icon="document">
+    [UART, DMA, and Data Pipelines](./uart-dma-data-pipelines). Parse GPS NMEA sentences over UART, log data to a microSD card over SPI, and use DMA for efficient data movement without CPU polling.
+    **Build:** GPS data logger with SD storage. **Parts:** NEO-6M GPS module, microSD module.
+  </Card>
+
+  <Card title="Lesson 6: Embassy Async Runtime" icon="document">
+    [Embassy Async Runtime](./embassy-async-runtime). Transition from polling to async/await with Embassy. Understand the executor, async tasks, timers, and channels. Rebuild earlier projects as concurrent async tasks.
+    **Build:** Multitask sensor dashboard (async). **Parts:** Reuse existing.
+  </Card>
+
+  <Card title="Lesson 7: Embassy Networking with Pico W" icon="document">
+    [Embassy Networking with Pico W](./embassy-networking-pico-w). Use embassy-net and the CYW43 driver for Wi-Fi connectivity. TCP sockets, HTTP serving, and MQTT publishing. Build a wireless sensor node.
+    **Build:** Wi-Fi sensor node with MQTT. **Parts:** Pico W (swap from Pico).
+  </Card>
+
+  <Card title="Lesson 8: PIO in Rust" icon="document">
+    [PIO in Rust](./pio-in-rust). Program the RP2040's Programmable I/O state machines from Rust using pio-rs. Drive WS2812B NeoPixel LEDs and implement custom protocols with PIO programs compiled at build time.
+    **Build:** NeoPixel LED strip controller. **Parts:** WS2812B LED strip (8 pixels).
+  </Card>
+
+  <Card title="Lesson 9: Async Sensor Hub Project" icon="document">
+    [Async Sensor Hub Project](./async-sensor-hub-project). Combine everything into a production-quality firmware: async tasks, sensor reading, display output, wireless reporting, SD card logging, and alarm outputs. Build a complete environmental monitoring station.
+    **Build:** Wireless environmental monitor with OLED, SD card, MQTT. **Parts:** Reuse all parts.
+  </Card>
+</CardGrid>
+
+## Parts Kit
+
+| Part | Quantity | First Used | Approximate Cost |
+|------|----------|------------|-----------------|
+| Raspberry Pi Pico | 1 | Lesson 1 | ~4 USD |
+| Raspberry Pi Pico W | 1 | Lesson 7 | ~6 USD |
+| Debug probe (Picoprobe or ST-Link V2) | 1 | Lesson 1 | 2-5 USD |
+| Micro USB cable | 2 | Lesson 1 | ~2 USD |
+| Breadboard + jumper wires | 1 set | Lesson 1 | 3-5 USD |
+| LEDs (assorted) + 220 ohm resistors | 4 each | Lesson 1 | ~1 USD |
+| Push buttons | 2 | Lesson 2 | ~0.50 USD |
+| SG90 micro servo | 1 | Lesson 3 | ~2 USD |
+| Potentiometer (10K) | 1 | Lesson 3 | ~0.25 USD |
+| Piezo buzzer | 1 | Lesson 3 | ~0.50 USD |
+| BME280 sensor module (I2C) | 1 | Lesson 4 | 2-3 USD |
+| SSD1306 OLED display (I2C, 128x64) | 1 | Lesson 4 | 3-4 USD |
+| NEO-6M GPS module | 1 | Lesson 5 | 3-5 USD |
+| MicroSD card module (SPI) | 1 | Lesson 5 | 1-2 USD |
+| MicroSD card (any size) | 1 | Lesson 5 | ~2 USD |
+| WS2812B LED strip (8 pixels) | 1 | Lesson 8 | 2-3 USD |
+
+**Total estimated cost: 30-45 USD** (including both Pico and Pico W)
+
+## Skill Progression
+
+| Skill | Lessons 1-3 | Lessons 4-5 | Lessons 6-7 | Lessons 8-9 |
+|-------|------------|------------|------------|------------|
+| **Rust Concepts** | Ownership, borrowing, typestate, Result | Traits, generics, embedded-hal | Async/await, futures, channels | PIO macros, build scripts, production patterns |
+| **Hardware** | GPIO, PWM, ADC, timers, interrupts | I2C, SPI, UART, DMA | Wi-Fi (CYW43), TCP/MQTT | PIO state machines, flash, watchdog |
+| **Projects** | Blink, button LED, servo | Sensor dashboard, GPS logger | Async dashboard, Wi-Fi node | NeoPixels, production monitor |
+| **Framework** | rp2040-hal (direct HAL) | rp2040-hal + drivers | Embassy async | Embassy + PIO + integration |
+
+## Prerequisites
+
+<Badge text="Embedded C experience required" variant="caution" />
+
+**You should be comfortable with:**
+- Microcontroller basics (GPIO, timers, interrupts, SPI/I2C concepts)
+- Our [Embedded Programming: RPi Pico](/education/embedded-programming-rpi-pico/) course or equivalent C-based embedded experience
+- Reading datasheets and register descriptions
+
+**Helpful but not required:**
+- Basic Rust syntax (variables, functions, structs, enums). The course explains ownership and borrowing from scratch in the embedded context.
+- Our [Embedded Programming: STM32](/education/embedded-programming-stm32/) course (gives broader ARM Cortex-M context)
+- Our [RTOS Programming](/education/rtos-programming/) course (helps appreciate what Embassy replaces)
+
+## Getting Started
+
+<Steps>
+1. **Get a Raspberry Pi Pico** (~4 USD) and a **Pico W** (~6 USD) for the wireless lesson. You need a debug probe for Rust development: either a second Pico flashed as a Picoprobe, or an ST-Link V2 clone.
+
+2. **Install Rust** from [rustup.rs](https://rustup.rs). The installer sets up rustc, cargo, and rustup. Lesson 1 walks through adding the `thumbv6m-none-eabi` target for Cortex-M0+.
+
+3. **Install probe-rs** for flashing and debugging. This replaces OpenOCD for Rust embedded workflows. One command: `cargo install probe-rs-tools`.
+
+4. **Start with Lesson 1.** You will create a Cargo project, configure the linker, and flash a blinking LED with defmt log output over RTT (Real-Time Transfer).
+
+5. **Work through lessons in order.** Each lesson builds on Rust concepts and hardware patterns from previous lessons.
+</Steps>
+
+:::tip[Coming from C embedded?]
+If you completed the [Embedded Programming: RPi Pico](/education/embedded-programming-rpi-pico/) course, you already know the RP2040 hardware. This course reuses that hardware knowledge and focuses on what Rust adds: compile-time safety, typestate peripherals, and async concurrency. The "C vs Rust" sidebars in each lesson map directly from patterns you already use.
+:::
+
+:::note[Picoprobe as debug probe]
+A second Pico flashed with the Picoprobe firmware works as a full SWD debug probe. This is the cheapest option (another 4 USD Pico) and is well-supported by probe-rs. See [the Picoprobe documentation](https://github.com/raspberrypi/picoprobe) for flashing instructions. An ST-Link V2 clone also works.
+:::
+
+<Copyright />
+
+<TawkWidget />

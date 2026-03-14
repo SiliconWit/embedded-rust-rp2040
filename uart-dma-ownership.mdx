@@ -1,0 +1,1441 @@
+---
+title: "UART, DMA, and Ownership"
+description: "Configure async UART with DMA on the RP2040, parse GPS NMEA sentences from a NEO-6M module, and see how Rust ownership prevents the buffer aliasing bugs that haunt C DMA code."
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-03-09
+tags: ["rust", "rp2040", "uart", "dma", "ownership", "gps", "nmea", "embassy", "zero-copy"]
+excerpt: "Configure async UART with DMA on the RP2040, parse GPS NMEA sentences from a NEO-6M module, and see how Rust ownership prevents the buffer aliasing bugs that haunt C DMA code."
+heroImage: "https://cdn.siliconwit.com/education/embedded-rust-rp2040/uart-dma-ownership.png"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
+
+DMA (Direct Memory Access) is where embedded C programmers write their most dangerous code. You hand a raw pointer to the DMA controller, start the transfer, and then rely on comments like "do not touch this buffer until DMA is done" to prevent corruption. There is nothing in the C language that enforces this. Rust changes the equation entirely. When you start a DMA transfer, the buffer's ownership moves into the transfer handle. The compiler will reject any attempt to read or write the buffer while DMA is active, not at runtime with a hard fault, but at compile time with a clear error message. In this lesson you will configure UART with DMA on the RP2040, receive NMEA sentences from a GPS module, parse coordinates, and output formatted position data over USB serial. Every buffer interaction is provably safe. #UART #DMA #Ownership
+
+## What We Are Building
+
+<Card title="GPS Coordinate Parser" icon="star">
+A Raspberry Pi Pico receives NMEA sentences from a NEO-6M GPS module over UART with DMA reception. The firmware parses GPRMC and GPGGA sentences to extract latitude, longitude, altitude, speed, and fix quality. Parsed data is formatted and sent over USB serial (or defmt) every second. The DMA reception runs continuously without CPU involvement, and Rust's ownership model guarantees the receive buffer is never accessed during an active transfer.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| GPS Module | u-blox NEO-6M (9600 baud default) |
+| UART | UART0, 9600 baud, 8N1 |
+| UART Pins | TX = GP0, RX = GP1 |
+| DMA | Automatic via Embassy async UART |
+| Output | defmt-rtt or USB CDC serial |
+| Update Rate | 1 Hz (GPS default output rate) |
+| Framework | Embassy (embassy-rp) |
+
+### Bill of Materials
+
+| Ref | Component | Quantity | Notes |
+|-----|-----------|----------|-------|
+| 1 | Raspberry Pi Pico | 1 | RP2040-based board |
+| 2 | NEO-6M GPS module | 1 | With onboard antenna, 3.3V compatible |
+| 3 | LED (any color) | 1 | GPS fix indicator |
+| 4 | 220 ohm resistor | 1 | LED current limiting |
+| 5 | Breadboard + jumper wires | 1 set | |
+| 6 | USB Micro-B cable | 1 | For programming and serial |
+
+### Wiring Table
+
+| Pico Pin | GPIO | Connection | Notes |
+|----------|------|------------|-------|
+| Pin 1 | GP0 | NEO-6M RX | Pico TX to GPS RX |
+| Pin 2 | GP1 | NEO-6M TX | Pico RX from GPS TX |
+| Pin 36 | 3V3(OUT) | NEO-6M VCC | 3.3V supply |
+| Pin 38 | GND | NEO-6M GND | Common ground |
+| Pin 20 | GP15 | LED anode (through 220 ohm) | Fix indicator |
+| Pin 38 | GND | LED cathode | |
+
+**Important**: The NEO-6M TX connects to the Pico's RX (GP1), and the NEO-6M RX connects to the Pico's TX (GP0). This is a crossover connection. Double-check this, as swapping TX/RX is the most common UART wiring mistake.
+
+## UART Configuration with Embassy
+
+<InArticleAd />
+
+
+Embassy provides async UART through the `embassy-rp` crate. The async implementation uses DMA internally, so every `read` and `write` call is non-blocking and allows other tasks to run during the transfer.
+
+### Basic UART Setup
+
+```rust
+use embassy_rp::uart::{self, Config as UartConfig, InterruptHandler as UartInterruptHandler};
+use embassy_rp::bind_interrupts;
+use embassy_rp::peripherals::UART0;
+
+// Bind UART0 interrupt for async operation
+bind_interrupts!(struct Irqs {
+    UART0_IRQ => UartInterruptHandler<UART0>;
+});
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+
+    // Configure UART0 at 9600 baud (GPS default)
+    let mut uart_config = UartConfig::default();
+    uart_config.baudrate = 9600;
+
+    let uart = uart::Uart::new(
+        p.UART0,
+        p.PIN_0,  // TX
+        p.PIN_1,  // RX
+        Irqs,
+        p.DMA_CH0, // DMA channel for TX
+        p.DMA_CH1, // DMA channel for RX
+        uart_config,
+    );
+}
+```
+
+Notice that the constructor takes DMA channels (`p.DMA_CH0`, `p.DMA_CH1`) as owned parameters. The RP2040 has 12 DMA channels, and Embassy ensures each channel can only be used by one peripheral at a time through the ownership system. Trying to pass `p.DMA_CH0` to both UART and another peripheral would be a compile error.
+
+### Splitting TX and RX
+
+For a GPS application, you typically need the RX half in one task (receiving NMEA sentences) and the TX half in another task (or not at all). Embassy lets you split the UART into independent TX and RX halves:
+
+```rust
+let (tx, rx) = uart.split();
+
+// Now tx and rx can be moved into separate tasks
+spawner.spawn(gps_receiver_task(rx)).unwrap();
+spawner.spawn(gps_sender_task(tx)).unwrap();
+```
+
+This split is a zero-cost operation. It moves ownership of the TX and RX hardware into separate handles. The compiler guarantees that no task can accidentally use the wrong half.
+
+## Async UART Read and Write
+
+<InArticleAd />
+
+
+### Reading Bytes
+
+The simplest read fills a buffer and returns when the buffer is full:
+
+```rust
+use embassy_rp::uart::UartRx;
+
+#[embassy_executor::task]
+async fn reader_task(mut rx: UartRx<'static, UART0, uart::Async>) {
+    let mut buf = [0u8; 128];
+
+    loop {
+        // Read exactly 128 bytes. This awaits until the DMA
+        // has filled the entire buffer.
+        match rx.read(&mut buf).await {
+            Ok(()) => {
+                defmt::info!("Received {} bytes", buf.len());
+            }
+            Err(e) => {
+                defmt::error!("UART read error: {:?}", e);
+            }
+        }
+    }
+}
+```
+
+### Reading Until a Delimiter
+
+For NMEA parsing, you want to read until a newline character (`\n`), not until a fixed buffer size. Embassy does not provide a built-in `read_until` for UART, but you can read byte by byte or accumulate into a line buffer:
+
+```rust
+/// Read UART bytes into a line buffer until '\n' is found.
+/// Returns the number of bytes in the line (including '\n').
+async fn read_line(
+    rx: &mut UartRx<'static, UART0, uart::Async>,
+    line_buf: &mut [u8],
+) -> Result<usize, uart::Error> {
+    let mut pos = 0usize;
+
+    loop {
+        let mut byte = [0u8; 1];
+        rx.read(&mut byte).await?;
+
+        if pos < line_buf.len() {
+            line_buf[pos] = byte[0];
+            pos += 1;
+        }
+
+        if byte[0] == b'\n' {
+            return Ok(pos);
+        }
+
+        // Safety limit: if the line is too long, return what we have
+        if pos >= line_buf.len() {
+            return Ok(pos);
+        }
+    }
+}
+```
+
+### Writing Bytes
+
+```rust
+use embassy_rp::uart::UartTx;
+
+#[embassy_executor::task]
+async fn writer_task(mut tx: UartTx<'static, UART0, uart::Async>) {
+    let message = b"Hello from Pico!\r\n";
+
+    loop {
+        // Write the entire message. The DMA handles the transfer.
+        tx.write(message).await.unwrap();
+        Timer::after_secs(1).await;
+    }
+}
+```
+
+## DMA and Rust Ownership: The Core Safety Guarantee
+
+<InArticleAd />
+
+
+This section explains the fundamental safety property that makes Rust DMA code superior to C DMA code. Understanding this is critical for writing correct firmware.
+
+### The Problem in C
+
+When you configure a DMA transfer in C, you pass a pointer to a buffer:
+
+```c
+// C: Start DMA reception into buffer
+uint8_t rx_buffer[256];
+dma_channel_configure(dma_chan, &cfg,
+    rx_buffer,           // Destination: raw pointer
+    &uart0_hw->dr,       // Source: UART data register
+    256,                 // Transfer count
+    true);               // Start immediately
+
+// WARNING: rx_buffer is now being written by DMA hardware.
+// Nothing in the C language prevents you from doing this:
+rx_buffer[0] = 0xFF;    // DATA CORRUPTION! DMA is still writing!
+memcpy(other_buf, rx_buffer, 256);  // READING PARTIAL DATA!
+printf("%s", rx_buffer);  // UNDEFINED BEHAVIOR!
+```
+
+The C compiler sees `rx_buffer` as a normal array. It has no concept of "this memory is currently owned by the DMA controller." The only protection is a comment and the programmer's discipline. In a multi-file project with multiple developers, someone will eventually access that buffer at the wrong time. The result is corrupted data, intermittent bugs, or hard faults that only appear under specific timing conditions.
+
+### The Solution in Rust
+
+In Rust, the DMA transfer takes ownership of the buffer. The buffer literally cannot be accessed until the transfer gives it back.
+
+```rust
+// Rust: Start DMA reception into buffer
+let rx_buffer = [0u8; 256];
+
+// The transfer TAKES OWNERSHIP of rx_buffer.
+// After this line, rx_buffer no longer exists in this scope.
+let transfer = rx.read(rx_buffer).await;
+
+// This would NOT compile:
+// rx_buffer[0] = 0xFF;
+//   error: use of moved value: `rx_buffer`
+
+// The buffer is returned when the transfer completes.
+// Only then can you access the data.
+```
+
+With Embassy's async UART, this ownership transfer is implicit in the `.await`. The `read` method borrows the buffer mutably (`&mut buf`), which means no other code can access `buf` while the read is in progress. The `.await` point suspends the task, and when DMA completes, the borrow ends and you can access the buffer again.
+
+```rust
+let mut buf = [0u8; 256];
+
+// During this .await, `buf` is exclusively borrowed by the UART driver.
+// The compiler prevents any other access to `buf` in this scope.
+rx.read(&mut buf).await.unwrap();
+
+// Now the borrow is released. We can safely read the DMA'd data.
+process_data(&buf);
+```
+
+### Why This Matters in Practice
+
+Consider a common C pattern with double-buffering:
+
+```c
+// C double-buffer DMA: notoriously bug-prone
+uint8_t buf_a[256];
+uint8_t buf_b[256];
+volatile int current_buf = 0;
+
+void dma_irq_handler() {
+    if (current_buf == 0) {
+        // Switch DMA to buf_b
+        dma_set_write_addr(dma_chan, buf_b);
+        current_buf = 1;
+        // Process buf_a... but is the main loop also touching buf_a?
+    } else {
+        dma_set_write_addr(dma_chan, buf_a);
+        current_buf = 0;
+    }
+    dma_start(dma_chan);
+}
+
+// Main loop
+while (1) {
+    if (current_buf == 1) {
+        process(buf_a);  // Is DMA really done with buf_a? Race condition!
+    }
+}
+```
+
+The `volatile int current_buf` flag is the only synchronization. There is a race condition between the IRQ handler switching buffers and the main loop checking the flag. This bug might work 99% of the time and corrupt data 1% of the time, making it extremely difficult to diagnose.
+
+In Rust with Embassy, double-buffering uses channels or swapped owned buffers, and the compiler verifies that each buffer is only accessed by one owner at a time.
+
+## GPS NMEA Sentence Parsing
+
+<InArticleAd />
+
+
+The NEO-6M GPS module outputs NMEA 0183 sentences at 9600 baud, one per line. Each sentence starts with `$`, contains comma-separated fields, and ends with `*XX\r\n` where `XX` is a two-character hexadecimal checksum.
+
+### Common NMEA Sentences
+
+| Sentence | Description | Key Fields |
+|----------|-------------|------------|
+| GPRMC | Recommended minimum data | Time, status, lat, lon, speed, date |
+| GPGGA | Fix information | Time, lat, lon, fix quality, satellites, altitude |
+| GPVTG | Course over ground | True heading, speed in knots and km/h |
+| GPGSA | Active satellites | Fix type (2D/3D), PDOP, HDOP, VDOP |
+| GPGSV | Satellites in view | Satellite IDs, elevation, azimuth, SNR |
+
+### GPRMC Sentence Format
+
+```
+$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
+       |      | |         | |         | |     |     |      |     |
+       |      | |         | |         | |     |     |      |     Checksum
+       |      | |         | |         | |     |     |      Magnetic var
+       |      | |         | |         | |     |     Date (DDMMYY)
+       |      | |         | |         | |     Course (degrees)
+       |      | |         | |         | Speed (knots)
+       |      | |         | Longitude
+       |      | Latitude
+       |      Status (A=active, V=void)
+       Time (HHMMSS)
+```
+
+### NMEA Parser Implementation
+
+```rust
+/// Parsed GPS position data
+#[derive(Clone, Copy, defmt::Format)]
+struct GpsPosition {
+    latitude: f32,       // Decimal degrees (positive = North)
+    longitude: f32,      // Decimal degrees (positive = East)
+    altitude_m: f32,     // Meters above sea level
+    speed_knots: f32,    // Speed over ground
+    satellites: u8,      // Number of satellites used
+    fix_valid: bool,     // True if GPS has a valid fix
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+}
+
+impl GpsPosition {
+    const fn empty() -> Self {
+        Self {
+            latitude: 0.0,
+            longitude: 0.0,
+            altitude_m: 0.0,
+            speed_knots: 0.0,
+            satellites: 0,
+            fix_valid: false,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
+/// Parse an NMEA sentence and update the position if relevant.
+/// Returns true if the position was updated.
+fn parse_nmea(line: &[u8], pos: &mut GpsPosition) -> bool {
+    // Validate minimum length and start character
+    if line.len() < 10 || line[0] != b'$' {
+        return false;
+    }
+
+    // Verify checksum
+    if !verify_checksum(line) {
+        return false;
+    }
+
+    // Extract the sentence type (e.g., "GPRMC", "GPGGA")
+    let sentence_type = &line[1..6];
+
+    if sentence_type == b"GPRMC" {
+        parse_gprmc(line, pos)
+    } else if sentence_type == b"GPGGA" {
+        parse_gpgga(line, pos)
+    } else {
+        false
+    }
+}
+
+/// Verify the NMEA checksum.
+/// The checksum is the XOR of all bytes between '$' and '*'.
+fn verify_checksum(line: &[u8]) -> bool {
+    let mut checksum: u8 = 0;
+    let mut found_star = false;
+    let mut expected: u8 = 0;
+
+    for (i, &byte) in line.iter().enumerate() {
+        if byte == b'$' {
+            continue;
+        }
+        if byte == b'*' {
+            found_star = true;
+            // Next two bytes are the hex checksum
+            if i + 2 < line.len() {
+                expected = hex_to_u8(line[i + 1], line[i + 2]);
+            }
+            break;
+        }
+        checksum ^= byte;
+    }
+
+    found_star && checksum == expected
+}
+
+fn hex_to_u8(high: u8, low: u8) -> u8 {
+    let h = match high {
+        b'0'..=b'9' => high - b'0',
+        b'A'..=b'F' => high - b'A' + 10,
+        b'a'..=b'f' => high - b'a' + 10,
+        _ => 0,
+    };
+    let l = match low {
+        b'0'..=b'9' => low - b'0',
+        b'A'..=b'F' => low - b'A' + 10,
+        b'a'..=b'f' => low - b'a' + 10,
+        _ => 0,
+    };
+    (h << 4) | l
+}
+
+/// Split a byte slice by commas, returning an array of field slices.
+/// Returns the number of fields found.
+fn split_fields<'a>(
+    data: &'a [u8],
+    fields: &mut [&'a [u8]; 20],
+) -> usize {
+    let mut count = 0usize;
+    let mut start = 0usize;
+
+    for i in 0..data.len() {
+        if data[i] == b',' || data[i] == b'*' {
+            if count < 20 {
+                fields[count] = &data[start..i];
+                count += 1;
+            }
+            start = i + 1;
+            if data[i] == b'*' {
+                break;
+            }
+        }
+    }
+
+    count
+}
+
+/// Parse a GPRMC sentence for position, speed, and time.
+fn parse_gprmc(line: &[u8], pos: &mut GpsPosition) -> bool {
+    let mut fields = [&[] as &[u8]; 20];
+    let count = split_fields(line, &mut fields);
+
+    if count < 10 {
+        return false;
+    }
+
+    // Field 0: sentence type ($GPRMC)
+    // Field 1: time (HHMMSS.SS)
+    // Field 2: status (A=active, V=void)
+    // Field 3: latitude (DDMM.MMMM)
+    // Field 4: N/S
+    // Field 5: longitude (DDDMM.MMMM)
+    // Field 6: E/W
+    // Field 7: speed in knots
+    // Field 8: course
+    // Field 9: date (DDMMYY)
+
+    // Check fix status
+    if fields[2].is_empty() || fields[2][0] != b'A' {
+        pos.fix_valid = false;
+        return false;
+    }
+
+    pos.fix_valid = true;
+
+    // Parse time
+    if fields[1].len() >= 6 {
+        pos.hours = parse_u8_2digit(fields[1][0], fields[1][1]);
+        pos.minutes = parse_u8_2digit(fields[1][2], fields[1][3]);
+        pos.seconds = parse_u8_2digit(fields[1][4], fields[1][5]);
+    }
+
+    // Parse latitude (DDMM.MMMM format)
+    if fields[3].len() >= 4 {
+        let degrees = parse_u8_2digit(fields[3][0], fields[3][1]) as f32;
+        let minutes = parse_nmea_float(fields[3]);
+        let minutes_val = minutes - (degrees * 100.0);
+        pos.latitude = degrees + minutes_val / 60.0;
+
+        if !fields[4].is_empty() && fields[4][0] == b'S' {
+            pos.latitude = -pos.latitude;
+        }
+    }
+
+    // Parse longitude (DDDMM.MMMM format)
+    if fields[5].len() >= 5 {
+        let degrees_str = &fields[5][..3];
+        let degrees = parse_u8_3digit(degrees_str) as f32;
+        let minutes = parse_nmea_float(fields[5]);
+        let minutes_val = minutes - (degrees * 100.0);
+        pos.longitude = degrees + minutes_val / 60.0;
+
+        if !fields[6].is_empty() && fields[6][0] == b'W' {
+            pos.longitude = -pos.longitude;
+        }
+    }
+
+    // Parse speed in knots
+    if !fields[7].is_empty() {
+        pos.speed_knots = parse_nmea_float(fields[7]);
+    }
+
+    true
+}
+
+/// Parse a GPGGA sentence for altitude and satellite count.
+fn parse_gpgga(line: &[u8], pos: &mut GpsPosition) -> bool {
+    let mut fields = [&[] as &[u8]; 20];
+    let count = split_fields(line, &mut fields);
+
+    if count < 10 {
+        return false;
+    }
+
+    // Field 0: sentence type ($GPGGA)
+    // Field 6: fix quality (0=invalid, 1=GPS fix, 2=DGPS fix)
+    // Field 7: number of satellites
+    // Field 9: altitude in meters
+
+    // Fix quality
+    if fields[6].is_empty() || fields[6][0] == b'0' {
+        return false;
+    }
+
+    // Number of satellites
+    if !fields[7].is_empty() {
+        pos.satellites = parse_u8_field(fields[7]);
+    }
+
+    // Altitude
+    if !fields[9].is_empty() {
+        pos.altitude_m = parse_nmea_float(fields[9]);
+    }
+
+    true
+}
+
+// -----------------------------------------------------------
+// Numeric parsing helpers (no_std, no alloc)
+// -----------------------------------------------------------
+
+fn parse_u8_2digit(high: u8, low: u8) -> u8 {
+    (high.wrapping_sub(b'0')) * 10 + (low.wrapping_sub(b'0'))
+}
+
+fn parse_u8_3digit(s: &[u8]) -> u16 {
+    if s.len() < 3 {
+        return 0;
+    }
+    let h = s[0].wrapping_sub(b'0') as u16;
+    let m = s[1].wrapping_sub(b'0') as u16;
+    let l = s[2].wrapping_sub(b'0') as u16;
+    h * 100 + m * 10 + l
+}
+
+fn parse_u8_field(s: &[u8]) -> u8 {
+    let mut val = 0u8;
+    for &b in s {
+        if b >= b'0' && b <= b'9' {
+            val = val.wrapping_mul(10).wrapping_add(b - b'0');
+        } else {
+            break;
+        }
+    }
+    val
+}
+
+/// Parse a float from a byte slice (e.g., "4807.038" or "22.4").
+/// Simple implementation for NMEA fields; handles integer and one decimal part.
+fn parse_nmea_float(s: &[u8]) -> f32 {
+    let mut integer_part: i32 = 0;
+    let mut decimal_part: i32 = 0;
+    let mut decimal_divisor: f32 = 1.0;
+    let mut in_decimal = false;
+    let mut negative = false;
+
+    for &b in s {
+        if b == b'-' {
+            negative = true;
+        } else if b == b'.' {
+            in_decimal = true;
+        } else if b >= b'0' && b <= b'9' {
+            if in_decimal {
+                decimal_part = decimal_part * 10 + (b - b'0') as i32;
+                decimal_divisor *= 10.0;
+            } else {
+                integer_part = integer_part * 10 + (b - b'0') as i32;
+            }
+        }
+    }
+
+    let val = integer_part as f32 + decimal_part as f32 / decimal_divisor;
+    if negative { -val } else { val }
+}
+```
+
+## C vs Rust: DMA Buffer Safety
+
+<InArticleAd />
+
+
+<Tabs>
+<TabItem label="C (Raw Pointers)">
+
+```c
+// C DMA UART reception: the buffer is just a pointer.
+// Nothing prevents access during an active transfer.
+
+#include "hardware/dma.h"
+#include "hardware/uart.h"
+
+#define BUF_SIZE 256
+uint8_t dma_buffer[BUF_SIZE];
+volatile bool dma_complete = false;
+
+void dma_irq_handler() {
+    dma_hw->ints0 = 1u << dma_chan;
+    dma_complete = true;
+    // But what if main() already started reading dma_buffer
+    // before this flag was set? Race condition.
+}
+
+void start_dma_uart_rx() {
+    dma_channel_configure(dma_chan, &cfg,
+        dma_buffer,          // dest: raw pointer, no protection
+        &uart0_hw->dr,       // source: UART data register
+        BUF_SIZE,
+        true);               // start
+
+    // From here until dma_irq_handler fires:
+    // - dma_buffer is being written by hardware
+    // - C allows: dma_buffer[0] = 0; (compiles fine, corrupts data)
+    // - C allows: memcpy(out, dma_buffer, 256); (reads partial data)
+    // - C allows: printf("%s", dma_buffer); (undefined behavior)
+    //
+    // The ONLY protection is this comment and the volatile flag.
+    // A developer on the team who did not read this file will
+    // access the buffer and introduce a subtle, intermittent bug.
+}
+
+void main_loop() {
+    start_dma_uart_rx();
+
+    while (1) {
+        if (dma_complete) {
+            dma_complete = false;
+            process(dma_buffer);   // Usually safe. Usually.
+            start_dma_uart_rx();
+            // What if process() is slow and DMA finishes during it?
+            // dma_buffer is being overwritten while process() reads it.
+        }
+        // Any code here can accidentally touch dma_buffer.
+        // The compiler will not warn.
+    }
+}
+```
+
+</TabItem>
+<TabItem label="Rust (Ownership Transfer)">
+
+```rust
+// Rust DMA UART reception: the buffer is OWNED by the transfer.
+// The compiler prevents access during an active transfer.
+
+use embassy_rp::uart::{self, UartRx};
+
+#[embassy_executor::task]
+async fn receiver_task(mut rx: UartRx<'static, UART0, uart::Async>) {
+    let mut buf = [0u8; 256];
+
+    loop {
+        // rx.read() borrows `buf` exclusively.
+        // During this .await, `buf` cannot be accessed.
+        //
+        // Attempting to read buf[0] here would be a compile error:
+        //   "cannot use `buf` because it was mutably borrowed"
+        //
+        // This is not a runtime check. This is not a flag.
+        // This is the compiler proving your code is correct.
+        rx.read(&mut buf).await.unwrap();
+
+        // .await returned, so the borrow is released.
+        // DMA is guaranteed complete. Safe to read.
+        process(&buf);
+
+        // Even in a multi-task system, no other task can
+        // access `buf` because it is a local variable.
+        // Ownership is enforced at compile time.
+    }
+}
+
+// Attempting to share the buffer with another task:
+// let shared = &buf;
+// spawner.spawn(other_task(shared));
+//   error: `buf` does not live long enough
+//   error: cannot borrow `buf` as immutable because it is
+//          also borrowed as mutable
+```
+
+</TabItem>
+</Tabs>
+
+The C version relies on a `volatile bool` flag and programmer discipline. The Rust version uses the type system to make buffer aliasing during DMA literally impossible to express in the language. This is not a style preference; it eliminates an entire category of bugs that cost embedded teams weeks of debugging.
+
+## Complete Project: GPS Coordinate Parser
+
+<InArticleAd />
+
+
+### Project Structure
+
+<FileTree>
+- gps-parser/
+  - .cargo/
+    - config.toml
+  - src/
+    - main.rs
+  - Cargo.toml
+  - build.rs
+  - memory.x
+  - rust-toolchain.toml
+</FileTree>
+
+### Full Source Code
+
+```rust
+// src/main.rs
+// GPS NMEA parser with async UART DMA reception
+
+#![no_std]
+#![no_main]
+
+use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::UART0;
+use embassy_rp::uart::{self, Config as UartConfig, InterruptHandler as UartInterruptHandler};
+use embassy_rp::uart::{UartRx, UartTx};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
+use {defmt_rtt as _, panic_halt as _};
+
+// Bind UART0 interrupt
+bind_interrupts!(struct Irqs {
+    UART0_IRQ => UartInterruptHandler<UART0>;
+});
+
+// -----------------------------------------------------------
+// Shared State
+// -----------------------------------------------------------
+
+/// Signal to pass the latest GPS position from receiver to display task
+static GPS_SIGNAL: Signal<CriticalSectionRawMutex, GpsPosition> = Signal::new();
+
+// -----------------------------------------------------------
+// GPS Data Types
+// -----------------------------------------------------------
+
+#[derive(Clone, Copy, defmt::Format)]
+struct GpsPosition {
+    latitude: f32,
+    longitude: f32,
+    altitude_m: f32,
+    speed_knots: f32,
+    satellites: u8,
+    fix_valid: bool,
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+}
+
+impl GpsPosition {
+    const fn empty() -> Self {
+        Self {
+            latitude: 0.0,
+            longitude: 0.0,
+            altitude_m: 0.0,
+            speed_knots: 0.0,
+            satellites: 0,
+            fix_valid: false,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
+// -----------------------------------------------------------
+// NMEA Parser Functions
+// -----------------------------------------------------------
+
+fn verify_checksum(line: &[u8]) -> bool {
+    let mut checksum: u8 = 0;
+    let mut found_star = false;
+    let mut expected: u8 = 0;
+
+    for (i, &byte) in line.iter().enumerate() {
+        if byte == b'$' {
+            continue;
+        }
+        if byte == b'*' {
+            found_star = true;
+            if i + 2 < line.len() {
+                expected = hex_to_u8(line[i + 1], line[i + 2]);
+            }
+            break;
+        }
+        checksum ^= byte;
+    }
+
+    found_star && checksum == expected
+}
+
+fn hex_to_u8(high: u8, low: u8) -> u8 {
+    let h = match high {
+        b'0'..=b'9' => high - b'0',
+        b'A'..=b'F' => high - b'A' + 10,
+        b'a'..=b'f' => high - b'a' + 10,
+        _ => 0,
+    };
+    let l = match low {
+        b'0'..=b'9' => low - b'0',
+        b'A'..=b'F' => low - b'A' + 10,
+        b'a'..=b'f' => low - b'a' + 10,
+        _ => 0,
+    };
+    (h << 4) | l
+}
+
+fn split_fields<'a>(data: &'a [u8], fields: &mut [&'a [u8]; 20]) -> usize {
+    let mut count = 0usize;
+    let mut start = 0usize;
+
+    for i in 0..data.len() {
+        if data[i] == b',' || data[i] == b'*' {
+            if count < 20 {
+                fields[count] = &data[start..i];
+                count += 1;
+            }
+            start = i + 1;
+            if data[i] == b'*' {
+                break;
+            }
+        }
+    }
+
+    count
+}
+
+fn parse_u8_2digit(high: u8, low: u8) -> u8 {
+    (high.wrapping_sub(b'0')) * 10 + (low.wrapping_sub(b'0'))
+}
+
+fn parse_u8_3digit(s: &[u8]) -> u16 {
+    if s.len() < 3 {
+        return 0;
+    }
+    (s[0].wrapping_sub(b'0') as u16) * 100
+        + (s[1].wrapping_sub(b'0') as u16) * 10
+        + (s[2].wrapping_sub(b'0') as u16)
+}
+
+fn parse_u8_field(s: &[u8]) -> u8 {
+    let mut val = 0u8;
+    for &b in s {
+        if b >= b'0' && b <= b'9' {
+            val = val.wrapping_mul(10).wrapping_add(b - b'0');
+        } else {
+            break;
+        }
+    }
+    val
+}
+
+fn parse_nmea_float(s: &[u8]) -> f32 {
+    let mut integer_part: i32 = 0;
+    let mut decimal_part: i32 = 0;
+    let mut decimal_divisor: f32 = 1.0;
+    let mut in_decimal = false;
+    let mut negative = false;
+
+    for &b in s {
+        if b == b'-' {
+            negative = true;
+        } else if b == b'.' {
+            in_decimal = true;
+        } else if b >= b'0' && b <= b'9' {
+            if in_decimal {
+                decimal_part = decimal_part * 10 + (b - b'0') as i32;
+                decimal_divisor *= 10.0;
+            } else {
+                integer_part = integer_part * 10 + (b - b'0') as i32;
+            }
+        }
+    }
+
+    let val = integer_part as f32 + decimal_part as f32 / decimal_divisor;
+    if negative { -val } else { val }
+}
+
+fn parse_gprmc(line: &[u8], pos: &mut GpsPosition) -> bool {
+    let mut fields = [&[] as &[u8]; 20];
+    let count = split_fields(line, &mut fields);
+
+    if count < 10 {
+        return false;
+    }
+
+    if fields[2].is_empty() || fields[2][0] != b'A' {
+        pos.fix_valid = false;
+        return false;
+    }
+
+    pos.fix_valid = true;
+
+    // Time
+    if fields[1].len() >= 6 {
+        pos.hours = parse_u8_2digit(fields[1][0], fields[1][1]);
+        pos.minutes = parse_u8_2digit(fields[1][2], fields[1][3]);
+        pos.seconds = parse_u8_2digit(fields[1][4], fields[1][5]);
+    }
+
+    // Latitude
+    if fields[3].len() >= 4 {
+        let degrees = parse_u8_2digit(fields[3][0], fields[3][1]) as f32;
+        let raw = parse_nmea_float(fields[3]);
+        let minutes_val = raw - (degrees * 100.0);
+        pos.latitude = degrees + minutes_val / 60.0;
+
+        if !fields[4].is_empty() && fields[4][0] == b'S' {
+            pos.latitude = -pos.latitude;
+        }
+    }
+
+    // Longitude
+    if fields[5].len() >= 5 {
+        let degrees = parse_u8_3digit(&fields[5][..3]) as f32;
+        let raw = parse_nmea_float(fields[5]);
+        let minutes_val = raw - (degrees * 100.0);
+        pos.longitude = degrees + minutes_val / 60.0;
+
+        if !fields[6].is_empty() && fields[6][0] == b'W' {
+            pos.longitude = -pos.longitude;
+        }
+    }
+
+    // Speed
+    if !fields[7].is_empty() {
+        pos.speed_knots = parse_nmea_float(fields[7]);
+    }
+
+    true
+}
+
+fn parse_gpgga(line: &[u8], pos: &mut GpsPosition) -> bool {
+    let mut fields = [&[] as &[u8]; 20];
+    let count = split_fields(line, &mut fields);
+
+    if count < 10 {
+        return false;
+    }
+
+    if fields[6].is_empty() || fields[6][0] == b'0' {
+        return false;
+    }
+
+    if !fields[7].is_empty() {
+        pos.satellites = parse_u8_field(fields[7]);
+    }
+
+    if !fields[9].is_empty() {
+        pos.altitude_m = parse_nmea_float(fields[9]);
+    }
+
+    true
+}
+
+fn parse_nmea(line: &[u8], pos: &mut GpsPosition) -> bool {
+    if line.len() < 10 || line[0] != b'$' {
+        return false;
+    }
+
+    if !verify_checksum(line) {
+        return false;
+    }
+
+    let sentence_type = &line[1..6];
+
+    if sentence_type == b"GPRMC" {
+        parse_gprmc(line, pos)
+    } else if sentence_type == b"GPGGA" {
+        parse_gpgga(line, pos)
+    } else {
+        false
+    }
+}
+
+// -----------------------------------------------------------
+// Line reader helper
+// -----------------------------------------------------------
+
+async fn read_line(
+    rx: &mut UartRx<'static, UART0, uart::Async>,
+    line_buf: &mut [u8],
+) -> Result<usize, uart::Error> {
+    let mut pos = 0usize;
+
+    loop {
+        let mut byte = [0u8; 1];
+        rx.read(&mut byte).await?;
+
+        if pos < line_buf.len() {
+            line_buf[pos] = byte[0];
+            pos += 1;
+        }
+
+        if byte[0] == b'\n' {
+            return Ok(pos);
+        }
+
+        if pos >= line_buf.len() {
+            return Ok(pos);
+        }
+    }
+}
+
+// -----------------------------------------------------------
+// Task 1: GPS Receiver (UART RX with DMA)
+// -----------------------------------------------------------
+
+#[embassy_executor::task]
+async fn gps_receiver_task(mut rx: UartRx<'static, UART0, uart::Async>) {
+    let mut line_buf = [0u8; 128];
+    let mut position = GpsPosition::empty();
+    let mut sentence_count: u32 = 0;
+
+    defmt::info!("GPS receiver task started, waiting for NMEA data...");
+
+    loop {
+        // Read one complete NMEA sentence (line ending with '\n')
+        // During this await, the line_buf is exclusively borrowed.
+        // No other code can access it. Compiler-guaranteed.
+        match read_line(&mut rx, &mut line_buf).await {
+            Ok(len) => {
+                sentence_count += 1;
+
+                // Parse the sentence
+                if parse_nmea(&line_buf[..len], &mut position) {
+                    // Send the updated position to the display task
+                    GPS_SIGNAL.signal(position);
+
+                    if sentence_count % 10 == 0 {
+                        defmt::info!(
+                            "Parsed {} sentences, fix={}",
+                            sentence_count,
+                            position.fix_valid
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                defmt::warn!("UART read error: {:?}", e);
+                // Small delay before retrying on error
+                Timer::after_millis(100).await;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------
+// Task 2: GPS Display / Reporter
+// -----------------------------------------------------------
+
+#[embassy_executor::task]
+async fn gps_display_task(mut fix_led: Output<'static>) {
+    defmt::info!("GPS display task started");
+
+    loop {
+        // Wait for a new position from the receiver task
+        let pos = GPS_SIGNAL.wait().await;
+
+        // Update fix indicator LED
+        if pos.fix_valid {
+            fix_led.set_high();
+        } else {
+            fix_led.set_low();
+        }
+
+        // Report over defmt
+        if pos.fix_valid {
+            defmt::info!("============ GPS Position ============");
+            defmt::info!(
+                "Time:       {:02}:{:02}:{:02} UTC",
+                pos.hours,
+                pos.minutes,
+                pos.seconds
+            );
+            defmt::info!("Latitude:   {}", pos.latitude);
+            defmt::info!("Longitude:  {}", pos.longitude);
+            defmt::info!("Altitude:   {} m", pos.altitude_m);
+            defmt::info!("Speed:      {} knots", pos.speed_knots);
+            defmt::info!("Satellites: {}", pos.satellites);
+            defmt::info!("======================================");
+        } else {
+            defmt::info!("GPS: waiting for fix... ({} satellites)", pos.satellites);
+            // Blink the LED to indicate searching
+            fix_led.toggle();
+            Timer::after_millis(200).await;
+            fix_led.toggle();
+        }
+    }
+}
+
+// -----------------------------------------------------------
+// Main
+// -----------------------------------------------------------
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+
+    // Configure UART0 for GPS at 9600 baud
+    let mut uart_config = UartConfig::default();
+    uart_config.baudrate = 9600;
+
+    let uart = uart::Uart::new(
+        p.UART0,
+        p.PIN_0,   // TX (Pico TX -> GPS RX)
+        p.PIN_1,   // RX (Pico RX <- GPS TX)
+        Irqs,
+        p.DMA_CH0, // TX DMA channel
+        p.DMA_CH1, // RX DMA channel
+        uart_config,
+    );
+
+    // Split UART into TX and RX halves
+    // TX is unused in this project, but we take it to satisfy ownership
+    let (_tx, rx) = uart.split();
+
+    // Fix indicator LED on GP15
+    let fix_led = Output::new(p.PIN_15, Level::Low);
+
+    defmt::info!("GPS parser starting...");
+    defmt::info!("UART0: TX=GP0, RX=GP1, 9600 baud");
+    defmt::info!("Waiting for NMEA sentences from NEO-6M...");
+
+    // Spawn tasks
+    spawner.spawn(gps_receiver_task(rx)).unwrap();
+    spawner.spawn(gps_display_task(fix_led)).unwrap();
+
+    // Main task: idle
+    loop {
+        Timer::after_secs(3600).await;
+    }
+}
+```
+
+### Cargo.toml
+
+```toml
+[package]
+name = "gps-parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
+embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
+embassy-time = { version = "0.4", features = ["generic-queue-8"] }
+embassy-sync = "0.6"
+
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
+defmt = "0.3"
+defmt-rtt = "0.4"
+
+portable-atomic = { version = "1.10", features = ["critical-section"] }
+static_cell = "2.1"
+
+[profile.release]
+opt-level = "s"
+debug = true
+lto = true
+codegen-units = 1
+```
+
+## Circular DMA Buffer Patterns
+
+<InArticleAd />
+
+
+For high-throughput UART applications (faster baud rates, continuous data streams), reading byte by byte is inefficient. A circular DMA buffer allows the DMA controller to continuously write incoming bytes into a ring buffer while the CPU reads processed data from behind the write pointer.
+
+In Embassy, the `embassy-rp` crate provides a `RingBufferedUartRx` for this purpose:
+
+```rust
+use embassy_rp::uart::BufferedUartRx;
+use static_cell::StaticCell;
+
+// Static buffer for the ring buffer (must outlive the UART)
+static RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+
+    let rx_buf = RX_BUF.init([0u8; 512]);
+
+    let mut uart_config = UartConfig::default();
+    uart_config.baudrate = 9600;
+
+    let rx = BufferedUartRx::new(
+        p.UART0,
+        Irqs,
+        p.PIN_1,  // RX pin
+        rx_buf,
+        uart_config,
+    );
+
+    spawner.spawn(buffered_receiver(rx)).unwrap();
+}
+
+#[embassy_executor::task]
+async fn buffered_receiver(mut rx: BufferedUartRx<'static, UART0>) {
+    let mut line = [0u8; 128];
+    let mut pos = 0usize;
+
+    loop {
+        // Read available bytes into a small temporary buffer
+        let mut tmp = [0u8; 32];
+        match rx.read(&mut tmp).await {
+            Ok(n) => {
+                for i in 0..n {
+                    if pos < line.len() {
+                        line[pos] = tmp[i];
+                        pos += 1;
+                    }
+
+                    if tmp[i] == b'\n' {
+                        // Process complete line
+                        process_line(&line[..pos]);
+                        pos = 0;
+                    }
+                }
+            }
+            Err(e) => {
+                defmt::warn!("Buffered UART error: {:?}", e);
+            }
+        }
+    }
+}
+```
+
+The `BufferedUartRx` uses an interrupt-driven ring buffer internally. When bytes arrive at the UART peripheral, the interrupt handler copies them into the ring buffer. Your task reads from the ring buffer at its own pace. If the ring buffer fills up (because your task is too slow), the oldest bytes are overwritten. For GPS at 9600 baud, a 512-byte ring buffer provides over 500 ms of buffer time, which is more than sufficient.
+
+### Ownership in the Ring Buffer
+
+The ring buffer (`rx_buf`) is passed to `BufferedUartRx::new()` by mutable reference. The `BufferedUartRx` holds an exclusive borrow on this buffer for its entire lifetime. You cannot access `rx_buf` directly while the UART is using it. The interrupt handler writes to the buffer, and your task reads from it through the `BufferedUartRx` API. There is no way to create a data race because the borrow checker prevents direct buffer access.
+
+## Production Notes
+
+<InArticleAd />
+
+
+### GPS Cold Start vs Warm Start
+
+| Start Type | Time to First Fix | Condition |
+|------------|-------------------|-----------|
+| Cold start | 30 to 60 seconds | First power-on, no satellite data cached |
+| Warm start | 5 to 15 seconds | Recent ephemeris data still valid |
+| Hot start | 1 to 2 seconds | Brief power interruption, all data valid |
+
+The NEO-6M has a backup battery input (VBAT) that keeps its RTC and ephemeris data alive during power-off. If your module has a battery, warm starts are typical. Without a battery, every power cycle is a cold start with up to a minute of waiting for satellites.
+
+### Antenna Placement
+
+GPS modules need a clear view of the sky. Indoor testing usually results in no fix or very poor accuracy. For development:
+
+<Steps>
+1. Place the GPS antenna near a window.
+2. Wait for the fix LED on the NEO-6M module to start blinking (indicates satellite acquisition).
+3. A solid blink pattern (1 Hz) indicates a valid fix.
+4. First cold start outdoors typically takes 30 to 45 seconds.
+</Steps>
+
+### Baud Rate Configuration
+
+The NEO-6M defaults to 9600 baud. You can configure it to higher rates (up to 115200) by sending UBX configuration commands over UART. For NMEA data at 1 Hz update rate, 9600 baud is sufficient (typical NMEA output is about 500 bytes per second).
+
+To change the baud rate, send a UBX-CFG-PRT message:
+
+```rust
+/// Send UBX command to change NEO-6M baud rate to 115200
+async fn set_gps_baudrate(tx: &mut UartTx<'static, UART0, uart::Async>) {
+    // UBX-CFG-PRT command to set UART1 to 115200 baud
+    let ubx_cmd: [u8; 28] = [
+        0xB5, 0x62,             // UBX sync chars
+        0x06, 0x00,             // CFG-PRT
+        0x14, 0x00,             // Payload length: 20
+        0x01,                   // Port ID: 1 (UART1)
+        0x00,                   // Reserved
+        0x00, 0x00,             // TX ready
+        0xD0, 0x08, 0x00, 0x00, // Mode: 8N1
+        0x00, 0xC2, 0x01, 0x00, // Baud rate: 115200
+        0x07, 0x00,             // In proto mask: UBX+NMEA
+        0x03, 0x00,             // Out proto mask: UBX+NMEA
+        0x00, 0x00,             // Flags
+        0x00, 0x00,             // Reserved
+        0xC0, 0x7E,             // Checksum
+    ];
+    let _ = tx.write(&ubx_cmd).await;
+}
+```
+
+After sending this command, you must also reconfigure the Pico's UART to 115200 baud to continue communication.
+
+### Error Recovery
+
+In production GPS firmware, handle these common scenarios:
+
+```rust
+// Retry logic for UART errors
+let mut consecutive_errors = 0u32;
+
+loop {
+    match read_line(&mut rx, &mut line_buf).await {
+        Ok(len) => {
+            consecutive_errors = 0;
+            // Process...
+        }
+        Err(_) => {
+            consecutive_errors += 1;
+            if consecutive_errors > 10 {
+                defmt::error!("Too many UART errors, check wiring");
+                // In production: trigger watchdog reset or alert
+                Timer::after_secs(5).await;
+                consecutive_errors = 0;
+            }
+            Timer::after_millis(100).await;
+        }
+    }
+}
+```
+
+### Power Consumption
+
+The NEO-6M draws about 45 mA during acquisition and 35 mA during tracking. If battery life matters, consider using the module's power-save modes via UBX commands, or power-cycling the module through a GPIO-controlled MOSFET, only turning it on when a position update is needed.
+
+## Testing
+
+<InArticleAd />
+
+
+<Steps>
+1. Wire the NEO-6M GPS module to the Pico according to the wiring table. Double-check that the TX/RX crossover is correct (Pico GP0 TX to GPS RX, Pico GP1 RX to GPS TX).
+
+2. Build and flash:
+   ```bash
+   cargo build --release
+   cargo run --release
+   ```
+
+3. Open the serial monitor. You should immediately see:
+   ```
+   GPS parser starting...
+   UART0: TX=GP0, RX=GP1, 9600 baud
+   Waiting for NMEA sentences from NEO-6M...
+   GPS receiver task started, waiting for NMEA data...
+   GPS display task started
+   ```
+
+4. Wait for the GPS module to acquire satellites. The NEO-6M has a small red LED that blinks when it has a fix. During acquisition you will see:
+   ```
+   GPS: waiting for fix... (0 satellites)
+   GPS: waiting for fix... (3 satellites)
+   GPS: waiting for fix... (5 satellites)
+   ```
+
+5. Once the module gets a fix (typically 30 to 60 seconds outdoors, may not work indoors), the output changes to:
+   ```
+   ============ GPS Position ============
+   Time:       14:23:45 UTC
+   Latitude:   -1.286389
+   Longitude:  36.817223
+   Altitude:   1661.2 m
+   Speed:      0.1 knots
+   Satellites: 8
+   ======================================
+   ```
+
+6. The fix indicator LED on GP15 should turn on solid when a valid fix is active.
+
+7. Walk around with the Pico and GPS module. Watch the latitude and longitude change in the serial output. Speed should reflect your movement.
+
+8. If you see no NMEA data at all (no "Parsed N sentences" messages), check:
+   - TX/RX wiring (most common issue)
+   - GPS module power (3.3V, check with multimeter)
+   - Baud rate (9600 is the NEO-6M default)
+</Steps>
+
+## Summary
+
+<InArticleAd />
+
+
+UART with DMA on the RP2040 demonstrates one of Rust's most practical safety advantages over C. The ownership and borrowing system prevents buffer aliasing during DMA transfers at compile time, eliminating a class of bugs that are notoriously difficult to reproduce and diagnose in C firmware. Embassy's async UART hides the DMA complexity behind clean `read` and `write` calls, while the `BufferedUartRx` provides a high-performance ring buffer for continuous data streams. The GPS parser project shows a complete real-world application: receiving structured data over a serial link, parsing it without heap allocation, and sharing results between tasks using Embassy signals. In the next lesson, we will explore more advanced topics in the Embedded Rust ecosystem.
+
+<EmbeddedRustRp2040Comments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />
