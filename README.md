@@ -12,6 +12,8 @@ sidebar:
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Contributors Welcome](https://img.shields.io/badge/contributors-welcome-orange)
 
+**Read this course at:** [https://siliconwit.com/education/embedded-rust-rp2040/](https://siliconwit.com/education/embedded-rust-rp2040/)
+
 A hands-on course covering embedded Rust programming on the Raspberry Pi Pico using the rp2040-hal and Embassy async framework. Topics include toolchain setup, ownership-driven hardware access, typestate GPIO, PWM, interrupts, async tasks, I2C/SPI with embedded-hal, UART/DMA, USB devices, Wi-Fi networking, and a multi-sensor async project.
 
 ## Lessons
