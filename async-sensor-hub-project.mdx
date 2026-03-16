@@ -25,7 +25,7 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-Every lesson so far focused on one capability at a time. Now you will combine them into a single system that runs six async tasks concurrently on the Pico W. A BME280 sensor feeds temperature, humidity, and pressure data into a shared channel. One task updates an SSD1306 OLED display, another logs readings to a microSD card, another publishes JSON to an MQTT broker over Wi-Fi, and two more handle button input and LED status feedback. The entire system runs on a single stack with zero-copy channels, no RTOS, and no shared mutable globals. This is the payoff of everything you have learned in this course. #AsyncEmbedded #SensorHub #Capstone
+Individual peripherals are straightforward in isolation. The real challenge appears when you need a sensor reading every 100 ms, an OLED refresh every 500 ms, an SD card write every second, and an MQTT publish every two seconds, all without any task starving the others or corrupting shared data. In C with FreeRTOS, you would manage six threads, six stacks, and a web of mutexes. Embassy collapses this into six async tasks sharing a single stack, with zero-copy channels replacing mutexes and the compiler enforcing that no two tasks can alias the same buffer. In this capstone you will build exactly that system on the Pico W: BME280 readings flowing through channels to a display, an SD logger, an MQTT publisher, button handlers, and status LEDs, all running concurrently with no shared mutable globals. #AsyncEmbedded #SensorHub #Capstone
 
 ## What We Are Building
 
@@ -68,6 +68,30 @@ A Pico W running six concurrent Embassy tasks: sensor reading (BME280 over I2C a
 
 
 The sensor hub is organized as a set of independent async tasks that communicate through Embassy channels. Each task owns its peripherals exclusively. No task shares a mutable reference with any other task. This eliminates data races at compile time.
+
+```text
+  Pico W Sensor Hub Wiring
+  ──────────────────────────────────────────
+  GP4 (SDA0) ──── BME280 SDA     (I2C0 sensor)
+  GP5 (SCL0) ──── BME280 SCL
+
+  GP6 (SDA1) ──── SSD1306 SDA    (I2C1 display)
+  GP7 (SCL1) ──── SSD1306 SCL
+
+  GP10 (SCK)  ──── SD Card CLK   (SPI1 storage)
+  GP11 (MOSI) ──── SD Card MOSI
+  GP12 (MISO) ──── SD Card MISO
+  GP13 (CS)   ──── SD Card CS
+
+  GP16 ──330R──── Green LED      (Wi-Fi status)
+  GP17 ──330R──── Yellow LED     (SD activity)
+
+  GP18 ──── Button A (to GND)    (display mode)
+  GP19 ──── Button B (to GND)    (manual publish)
+
+  3V3 ──── All component VCC
+  GND ──── All component GND
+```
 
 ### Task Overview
 

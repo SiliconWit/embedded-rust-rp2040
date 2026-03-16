@@ -169,6 +169,18 @@ probe-rs --version
 
 The Pico has a 3-pin SWD debug header at the bottom of the board (SWCLK, SWDIO, GND). If you are using a second Pico as a Picoprobe, flash it with the [Picoprobe firmware](https://github.com/raspberrypi/picoprobe/releases) first by holding BOOTSEL, plugging it in, and dragging the UF2 file onto the drive.
 
+```text
+  SWD Debug Connection
+  ──────────────────────────────────────────
+  Picoprobe / ST-Link        Target Pico
+  (debug adapter)            (bottom edge)
+  ┌─────────┐                ┌─────────┐
+  │  SWDIO  ├────────────────┤  SWDIO  │
+  │  SWCLK  ├────────────────┤  SWCLK  │
+  │   GND   ├────────────────┤   GND   │
+  └─────────┘                └─────────┘
+```
+
 | Probe Pin | Target Pico Pin |
 |-----------|----------------|
 | SWCLK | SWCLK |

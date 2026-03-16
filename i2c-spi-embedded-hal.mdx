@@ -108,6 +108,30 @@ pub trait SpiDevice {
 
 ### How Portability Works
 
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+flowchart TD
+    subgraph App["Your Application (main.rs)"]
+        MAIN["let mut bme = Bme280::new(i2c, 0x76)"]
+    end
+
+    subgraph Driver["Driver Crate (bme280-rs)"]
+        DRV["fn read_temperature(i2c: &mut impl I2c)"]
+    end
+
+    subgraph HAL["HAL Crate (embassy-rp)"]
+        IMPL["impl I2c for embassy_rp::i2c::I2c"]
+    end
+
+    subgraph HW["RP2040 Hardware"]
+        I2C0["I2C0 peripheral registers"]
+    end
+
+    MAIN --> DRV
+    DRV -->|"calls i2c.write_read()"| IMPL
+    IMPL -->|"writes to hardware registers"| I2C0
+```
+
 The architecture has three layers:
 
 | Layer | Example | Role |

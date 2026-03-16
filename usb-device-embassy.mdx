@@ -25,7 +25,7 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-The RP2040 has a built-in USB 1.1 controller with an integrated PHY, so it can act as a USB device without any external chip. Plug it into a computer and it can appear as a serial port, a keyboard, a mouse, or all of these at once. In this lesson you will use embassy-usb to build a USB CDC virtual serial port that streams sensor data, a USB HID keyboard that sends keystrokes when you press a button, and finally a composite device that combines both. The embassy-usb builder pattern makes USB descriptor construction type-safe, catching errors at compile time that would silently corrupt a raw byte array in C. #USB #EmbassyRust #HID
+Most microcontrollers need a separate UART-to-USB bridge chip (an FTDI or CP2102) just to send serial data to a computer, and implementing USB device classes in C means hand-packing descriptor byte arrays where a single off-by-one error produces a device that silently fails to enumerate. The RP2040 has a built-in USB 1.1 controller with an integrated PHY, so it can act as a USB device without any external chip. Plug it into a computer and it can appear as a serial port, a keyboard, a mouse, or all of these at once. In this lesson you will use embassy-usb to build a USB CDC virtual serial port that streams sensor data, a USB HID keyboard that sends keystrokes when you press a button, and finally a composite device that combines both. The embassy-usb builder pattern makes descriptor construction type-safe, catching at compile time the layout errors that would take hours to debug with a protocol analyzer in C. #USB #EmbassyRust #HID
 
 ## What We Are Building
 
@@ -89,6 +89,21 @@ Every USB device describes itself through a tree of descriptors:
 | 4 | Endpoint Descriptor | Communication pipe: direction, transfer type, packet size, polling interval |
 
 A composite device has multiple interfaces under one configuration. Our device will have three interfaces: two for CDC (communication + data) and one for HID.
+
+```text
+  USB Descriptor Tree (Composite Device)
+  ──────────────────────────────────────────
+  Device Descriptor
+  ├── VID: 0xCAFE, PID: 0x0001
+  └── Configuration 1 (max 100 mA)
+      ├── Interface 0: CDC ACM (Communication)
+      │   └── Endpoint 1 IN (Interrupt, 8 bytes)
+      ├── Interface 1: CDC ACM (Data)
+      │   ├── Endpoint 2 IN  (Bulk, 64 bytes)
+      │   └── Endpoint 2 OUT (Bulk, 64 bytes)
+      └── Interface 2: HID Keyboard
+          └── Endpoint 3 IN (Interrupt, 8 bytes)
+```
 
 ## Project Setup
 

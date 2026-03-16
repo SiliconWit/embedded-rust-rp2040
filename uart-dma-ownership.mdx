@@ -27,6 +27,17 @@ import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2
 
 DMA (Direct Memory Access) is where embedded C programmers write their most dangerous code. You hand a raw pointer to the DMA controller, start the transfer, and then rely on comments like "do not touch this buffer until DMA is done" to prevent corruption. There is nothing in the C language that enforces this. Rust changes the equation entirely. When you start a DMA transfer, the buffer's ownership moves into the transfer handle. The compiler will reject any attempt to read or write the buffer while DMA is active, not at runtime with a hard fault, but at compile time with a clear error message. In this lesson you will configure UART with DMA on the RP2040, receive NMEA sentences from a GPS module, parse coordinates, and output formatted position data over USB serial. Every buffer interaction is provably safe. #UART #DMA #Ownership
 
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+stateDiagram-v2
+    [*] --> OwnedByCPU : Buffer allocated
+    OwnedByCPU --> OwnedByDMA : uart.read(&mut buf).await
+    note right of OwnedByDMA : Compiler rejects any\nread/write to buf here.\nCompile error, not runtime crash.
+    OwnedByDMA --> OwnedByCPU : .await completes\n(transfer done)
+    OwnedByCPU --> Processing : Parse NMEA data
+    Processing --> OwnedByCPU : Ready for next transfer
+```
+
 ## What We Are Building
 
 <Card title="GPS Coordinate Parser" icon="star">

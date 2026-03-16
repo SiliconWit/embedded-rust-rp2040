@@ -120,6 +120,19 @@ In Rust, this is structurally impossible. Module A takes ownership of the pin. M
 <InArticleAd />
 
 
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+flowchart TD
+    Start(["Pins new"]) --> Unconfigured["Unconfigured\nPin Gpio15, FunctionNull"]
+    Unconfigured -->|"into_push_pull_output()"| Output["Output\nPin Gpio15, SioOutput"]
+    Unconfigured -->|"into_pull_up_input()"| Input["Input\nPin Gpio15, SioInput, PullUp"]
+    Unconfigured -->|"into_function()"| Alt["Alternate Function\nI2C, SPI, UART, PWM"]
+    Output -->|"set_high() / set_low()"| Output
+    Output -->|"into_floating_disabled()"| Unconfigured
+    Input -->|"is_high() / is_low()"| Input
+    Input -->|"into_floating_disabled()"| Unconfigured
+```
+
 The typestate pattern encodes the state of a resource in its type. The rp2040-hal uses this extensively for GPIO pins. A pin that has not been configured has a different type than a pin configured as an output, and both have different types from a pin configured as an input. The compiler uses these types to determine which operations are valid.
 
 ### Pin State Types

@@ -25,7 +25,7 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-The Pico W adds an Infineon CYW43439 Wi-Fi chip to the standard Pico board, giving the RP2040 wireless connectivity over 802.11n on the 2.4 GHz band. In Rust, the `cyw43` crate provides the driver and `embassy-net` provides a full async TCP/IP stack, all without an operating system. In this lesson you will connect to a Wi-Fi network, open TCP sockets, send an HTTP GET request by hand, and build a complete MQTT sensor node that reads a BME280 sensor and publishes JSON payloads to a broker every 10 seconds, with automatic reconnection when the network drops. #PicoW #EmbassyNet #MQTT
+A sensor node tethered to USB can only report data to the machine it is plugged into. Adding Wi-Fi lets it publish readings to any MQTT broker on the network, but networking on a microcontroller without an OS means you need a TCP/IP stack, a Wi-Fi driver, and an async runtime that can juggle socket I/O alongside sensor reads without blocking either one. Embassy provides all three in Rust: the `cyw43` crate drives the Pico W's wireless chip, `embassy-net` handles TCP/IP, and the async executor keeps everything running concurrently on a single core. In this lesson you will connect to Wi-Fi, open TCP sockets, send a raw HTTP request, and build an MQTT sensor node that publishes BME280 readings every 10 seconds with automatic reconnection. #PicoW #EmbassyNet #MQTT
 
 ## What We Are Building
 
@@ -191,6 +191,20 @@ Bringing up Wi-Fi on the Pico W involves several steps:
 
 6. Spawn the network stack task, which processes packets in the background.
 </Steps>
+
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+stateDiagram-v2
+    [*] --> ConfigPins : PIO + SPI pins
+    ConfigPins --> LoadFirmware : Create cyw43 driver
+    LoadFirmware --> BackgroundTask : Spawn cyw43 task
+    BackgroundTask --> Joining : control.join_wpa2()
+    Joining --> Connected : WPA2 handshake OK
+    Joining --> Joining : Retry after backoff
+    Connected --> DHCPWait : Start DHCP
+    DHCPWait --> Ready : IP assigned
+    Ready --> [*]
+```
 
 ### Standalone Wi-Fi Example
 

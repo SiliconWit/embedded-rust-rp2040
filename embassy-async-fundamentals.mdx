@@ -101,6 +101,22 @@ Embassy achieves this by leveraging Rust's `async`/`await` at the language level
   </Card>
 </CardGrid>
 
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+flowchart TD
+    EX(["Executor loop"]) --> A["Poll Task A"]
+    A -->|"hits .await"| B["Poll Task B"]
+    B -->|"hits .await"| C["Poll Task C"]
+    C -->|"hits .await"| WFI["WFI\n(sleep until interrupt)"]
+    WFI -->|"Timer/peripheral\ninterrupt fires"| EX
+
+    subgraph Single Stack
+        A
+        B
+        C
+    end
+```
+
 ## Setting Up an Embassy Project
 
 <InArticleAd />

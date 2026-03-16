@@ -80,6 +80,29 @@ The SG90 draws up to 500 mA under load. USB power may cause the Pico to brown ou
 
 The RP2040 has 8 PWM slices, each with two output channels (A and B). Each slice has a 16-bit counter, a configurable divider (integer + 4-bit fractional), and independent duty cycle registers for each channel. Both channels in a slice share the same frequency (determined by the counter wrap value) but can have different duty cycles.
 
+```text
+  PWM Slice Architecture (one of 8 slices)
+  ──────────────────────────────────────────
+  125 MHz       ┌──────────┐    ┌─────────────┐
+  system ──────►│ Divider  │───►│ 16-bit      │
+  clock         │ int+frac │    │ Counter     │
+                └──────────┘    │ (0..wrap)   │
+                                └──────┬──────┘
+                                       │ compare
+                          ┌────────────┼────────────┐
+                          ▼                         ▼
+                   ┌─────────────┐           ┌─────────────┐
+                   │ Channel A   │           │ Channel B   │
+                   │ duty_a reg  │           │ duty_b reg  │
+                   └──────┬──────┘           └──────┬──────┘
+                          ▼                         ▼
+                     GPIO pin A                GPIO pin B
+                   (e.g. GP0)                (e.g. GP1)
+
+  Frequency = 125 MHz / (divider * (wrap + 1))
+  Duty cycle = duty_x / (wrap + 1) * 100%
+```
+
 ### PWM Slice Mapping
 
 Every GPIO pin on the RP2040 can be assigned to a specific PWM slice and channel. The mapping follows a fixed pattern:
