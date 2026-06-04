@@ -1036,7 +1036,7 @@ let spi_device = ExclusiveDevice::new(spi, cs, Delay).unwrap();
 ```
 
 :::tip[Instrument it]
-embedded-hal is how a Rust device talks to the real sensors a monitor is built from: an I2C pressure or temperature sensor, an SPI accelerometer or ADC. The payoff over C is exactly what monitoring needs, a driver that cannot quietly corrupt a buffer or block forever, so a node reading a machine can run untouched for months. Wire the sensor, read it through the trait, and the same code [streams to a dashboard](/education/iot-systems/) once you add a radio.
+embedded-hal is how a Rust device talks to the real sensors a monitor is built from: an I2C pressure or temperature sensor, an SPI accelerometer or ADC. The payoff over C is exactly what monitoring needs, a driver that cannot quietly corrupt a buffer or block forever, so a node reading a machine can run untouched for months. Wire the sensor, read it through the trait, and the same code [streams](/education/iot-systems/) to [siliconwit.io](https://siliconwit.io) once you add a radio.
 :::
 
 ## Production Notes
