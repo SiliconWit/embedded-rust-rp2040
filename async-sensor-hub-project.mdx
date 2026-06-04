@@ -1538,6 +1538,10 @@ The Rust version uses less RAM (single stack vs. 6 stacks), has zero risk of dat
 | Button does nothing | Wiring issue | Verify buttons connect to GND; check pull-up is enabled |
 | System panic on boot | Stack overflow | Increase RAM allocation or reduce buffer sizes |
 
+:::tip[Instrument it]
+A sensor hub like this is what a real asset monitor looks like: temperature, vibration, current, and position [read concurrently](/education/sensor-actuator-interfacing-stm32/), each on its own async task so a slow sensor never blocks a fast one. That concurrency is the whole point of monitoring a machine, you watch several signals at once and correlate them, and a temperature rise with a current rise with new vibration is a bearing going. Rust's guarantees keep a hub like this running untended for months, and it can [stream the full picture](https://siliconwit.io) for a machine you cannot babysit.
+:::
+
 ## Production Notes
 
 <InArticleAd />

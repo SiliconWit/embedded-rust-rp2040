@@ -794,6 +794,10 @@ let hp = BUZZER_HALF_PERIOD_ATOMIC.load(Ordering::Relaxed);
 
 This is lighter weight but only works for single values that can be updated atomically. For multiple related values that must be consistent (like a struct with both frequency and duration), use the Mutex pattern.
 
+:::tip[Instrument it]
+Timers and interrupts are not just for driving a servo, they are how you measure time-based signals precisely. Capture the interval between pulses from a Hall sensor and you have a tachometer reading RPM; trigger an ADC read on a timer and you sample a sensor at an exact, jitter-free rate, which is what clean vibration or current data depends on. Do the timing in hardware, and a Pico can [report accurate rates and waveforms](/education/iot-systems/) rather than smeared ones.
+:::
+
 ## Production Notes
 
 <InArticleAd />
