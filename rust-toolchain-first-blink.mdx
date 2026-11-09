@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-Every embedded Rust project begins with the same question: how do I get Rust code running on a microcontroller? The answer involves a cross-compilation target, a linker script that maps your code to the chip's memory layout, and a flash tool that speaks the debug probe's protocol. In this lesson, you will install everything from scratch, create an RP2040 project using Cargo, and flash a blinking LED with structured log output streaming back to your terminal over RTT. By the end, you will have a repeatable workflow for every lesson that follows. #EmbeddedRust #RP2040 #Toolchain
+A first program in a new language on a new chip often costs a day before any LED lights: the compiler builds for the wrong processor, the linker does not know where the chip's memory is, and nothing reaches the board. This lesson removes that day. You install the Rust tools, create a project for the RP2040 (the microcontroller on the Raspberry Pi Pico), and load a program that blinks an LED and prints log lines in your terminal. You also meet the first Rust rule that surprises a C programmer: a pin is a value, and only one part of the program can hold it. Every later project in the course uses the same files and commands. #EmbeddedRust #RP2040 #Toolchain
 
 ## What We Are Building
 
 <Card title="Blinking LED with defmt RTT Logging" icon="star">
-An LED that blinks at 1 Hz on the Raspberry Pi Pico, with structured log messages streaming to your terminal over RTT (Real-Time Transfer). The LED toggles every 500 ms using an alarm timer from the rp2040-hal crate. Each toggle prints the current state and a cycle counter through defmt, so you can verify timing and confirm the toolchain works end to end.
+An LED that blinks once per second (1 Hz) on the Raspberry Pi Pico. Each time the LED changes, the program prints its state and a cycle counter in your terminal. The log lines travel through the debug probe by RTT (Real-Time Transfer: the probe reads a small buffer in the chip's RAM, so no UART pin is used). The logging library is called defmt. When the LED blinks and the lines appear, every tool in the chain works.
 </Card>
 
 **Project specifications:**
@@ -43,7 +43,7 @@ An LED that blinks at 1 Hz on the Raspberry Pi Pico, with structured log message
 | Blink rate | 1 Hz (500 ms on, 500 ms off) |
 | Logging | defmt over RTT via probe-rs |
 | HAL crate | rp2040-hal 0.10 |
-| Toolchain | Rust nightly, thumbv6m-none-eabi target |
+| Toolchain | Rust stable, thumbv6m-none-eabi target |
 
 ### Bill of Materials
 
@@ -64,16 +64,14 @@ An LED that blinks at 1 Hz on the Raspberry Pi Pico, with structured log message
 | GP25 | Onboard LED | Built into the Pico board |
 | GP15 | External LED anode (long leg) | Through 220 ohm resistor |
 | GND | External LED cathode (short leg) | Via resistor to GND |
-| SWDIO (debug header) | Probe SWDIO | SWD data |
-| SWCLK (debug header) | Probe SWCLK | SWD clock |
-| GND (debug header) | Probe GND | Common ground |
 
-If using a Picoprobe, the probe Pico connects to the target Pico through the SWD debug header at the bottom of the board. The three pins are SWCLK, SWDIO, and GND.
+A debug probe is a small adapter between your computer and the chip. It loads the program and reads the log lines through SWD (Serial Wire Debug), a port of two signal wires on the bottom edge of the Pico: SWCLK (clock) and SWDIO (data), plus GND. A second Pico with the Picoprobe firmware works as a probe.
 
 ## Installing the Rust Toolchain
 
 <InArticleAd />
 
+Your computer and the RP2040 have different processors: the RP2040 has an ARM Cortex-M0+ core. So the compiler must cross-compile, which means it runs on one processor and produces code for another. You install the compiler, a target (the description of the processor to build for), and a tool that speaks to the debug probe.
 
 <Tabs>
 <TabItem label="Linux (Ubuntu/Debian)">
@@ -159,33 +157,25 @@ probe-rs --version
 
 | Tool | Purpose |
 |------|---------|
-| `rustup` | Manages Rust toolchain versions and cross-compilation targets |
-| `thumbv6m-none-eabi` | Compilation target for ARM Cortex-M0+ (the RP2040 core) |
-| `probe-rs` | Flashes firmware, provides RTT log output, and drives GDB debugging |
-| `flip-link` | Custom linker wrapper that flips the stack to detect overflows |
-| `elf2uf2-rs` | Converts ELF binaries to UF2 format for drag-and-drop flashing (backup) |
+| `rustup` | Installs the Rust compiler and its targets, and keeps them up to date |
+| `thumbv6m-none-eabi` | The target for ARM Cortex-M0+ (the RP2040 core). `none` means there is no operating system |
+| `probe-rs` | Loads the program into flash through the probe, shows the RTT log lines, and serves the GDB debugger |
+| `flip-link` | A linker wrapper that puts the stack at the bottom of RAM, so a stack overflow stops the program at once and cannot overwrite your variables |
+| `elf2uf2-rs` | Converts the built program (an ELF file) to UF2 format for loading without a probe |
 
 ### Connecting the Debug Probe
 
-The Pico has a 3-pin SWD debug header at the bottom of the board (SWCLK, SWDIO, GND). If you are using a second Pico as a Picoprobe, flash it with the [Picoprobe firmware](https://github.com/raspberrypi/picoprobe/releases) first by holding BOOTSEL, plugging it in, and dragging the UF2 file onto the drive.
+If you use a second Pico as the probe, first load the [Picoprobe firmware](https://github.com/raspberrypi/picoprobe/releases) onto it: hold BOOTSEL, plug it in, and copy the UF2 file onto the drive that appears. Then join the three SWD pins, each to the pin of the same name:
 
 ```text
-  SWD Debug Connection
-  ──────────────────────────────────────────
   Picoprobe / ST-Link        Target Pico
-  (debug adapter)            (bottom edge)
+  (debug probe)              (bottom edge)
   ┌─────────┐                ┌─────────┐
   │  SWDIO  ├────────────────┤  SWDIO  │
   │  SWCLK  ├────────────────┤  SWCLK  │
   │   GND   ├────────────────┤   GND   │
   └─────────┘                └─────────┘
 ```
-
-| Probe Pin | Target Pico Pin |
-|-----------|----------------|
-| SWCLK | SWCLK |
-| SWDIO | SWDIO |
-| GND | GND |
 
 Test the connection:
 
@@ -222,7 +212,7 @@ This should print the RP2040 memory layout and core information.
 
 ### Cargo.toml
 
-Create a new project and configure its dependencies:
+Cargo is Rust's build tool. It does the work of `make`, CMake and a library downloader together. The file `Cargo.toml` lists the libraries the project needs, and Cargo fetches and compiles them. Rust calls a library a crate. Create a new project:
 
 ```bash
 cargo init rp2040-blink
@@ -280,18 +270,18 @@ overflow-checks = false
 
 | Crate | Role |
 |-------|------|
-| `rp2040-hal` | Provides typed access to all RP2040 peripherals (GPIO, timers, PWM, I2C, SPI, etc.) |
-| `rp-pico` | Maps physical Pico board pins to RP2040 GPIO numbers |
-| `cortex-m` | Low-level access to ARM Cortex-M core features (interrupts, registers). The `rp2040-hal` already provides the critical-section implementation, so do not add `critical-section-single-core` here |
-| `cortex-m-rt` | Minimal runtime: vector table, stack pointer setup, calls `main()` |
-| `panic-halt` | Defines what happens on panic: halts the CPU (alternatives: `panic-probe` for defmt output) |
-| `defmt` | Structured logging that sends format strings to the host, not the target (saves flash) |
-| `defmt-rtt` | Transport layer for defmt: sends log data over RTT (Real-Time Transfer through the debug probe) |
-| `embedded-hal` | Standard traits for embedded peripherals (digital I/O, delays, SPI, I2C) |
+| `rp2040-hal` | The HAL (hardware abstraction layer): functions for the RP2040 peripherals (GPIO, timers, PWM, I2C, SPI). Each peripheral and pin has its own type, and that is how the compiler can check how you use it |
+| `rp-pico` | Names the pins of the Pico board (`pins.led` is GP25) |
+| `cortex-m` | Access to the ARM core itself (interrupt control, core registers). The `rp2040-hal` already provides the critical-section implementation, so do not add `critical-section-single-core` here |
+| `cortex-m-rt` | The startup code: vector table, stack pointer, then a call to your `main()` |
+| `panic-halt` | A panic is Rust's controlled stop when the program meets an error it cannot continue from. This crate decides what a panic does: stop the CPU (`panic-probe` prints the reason first) |
+| `defmt` | Logging that keeps the text of each message on your computer and sends only a small number from the chip (saves flash) |
+| `defmt-rtt` | Carries the defmt data to the debug probe over RTT |
+| `embedded-hal` | Traits for peripherals. A trait is a named set of functions that a type promises to have, like an interface: `OutputPin` promises `set_high()` and `set_low()` |
 
 ### memory.x
 
-The linker script tells the toolchain where flash and RAM are in the RP2040's address space:
+The linker is the tool that gives every function and variable its final address, so it must know where the chip's memory is. A C project for the Pico takes this file from the SDK. Here you write it:
 
 ```ld
 MEMORY {
@@ -310,13 +300,11 @@ SECTIONS {
 } INSERT BEFORE .text;
 ```
 
-The RP2040 has a unique boot process. The first 256 bytes of flash (the BOOT2 region) contain a second-stage bootloader that configures the external QSPI flash (the RP2040 has no internal flash; it executes from an external chip). The `rp2040-hal` crate provides this bootloader, and the linker script places it at the correct address. The main application code starts at `0x10000100`, after the boot2 block.
+The file declares three regions:
 
-| Region | Address | Size | Purpose |
-|--------|---------|------|---------|
-| BOOT2 | 0x10000000 | 256 bytes | Second-stage bootloader for QSPI flash |
-| FLASH | 0x10000100 | ~2 MB | Application code and read-only data |
-| RAM | 0x20000000 | 256 KB | Stack, heap, and mutable data |
+- `BOOT2` is the first 256 bytes of flash (`0x100`). The RP2040 has no flash inside the chip. It runs code from a separate flash chip on the board, and a small second-stage bootloader in these 256 bytes sets that chip up. The `rp-pico` crate supplies the bootloader (from the `rp2040-boot2` crate).
+- `FLASH` is the rest of the 2 MB, from `0x10000100`: your code and constant data.
+- `RAM` is 256 KB from `0x20000000`: the stack and the variables. The RP2040 has 264 KB of RAM in all; this file uses the main block of 256 KB.
 
 ### .cargo/config.toml
 
@@ -340,18 +328,18 @@ target = "thumbv6m-none-eabi"
 DEFMT_LOG = "debug"
 ```
 
-This configuration does several important things:
+What each setting does:
 
-- **`target`**: Every `cargo build` cross-compiles for ARM Cortex-M0+ without needing `--target` each time.
-- **`runner`**: `cargo run` flashes the firmware to the Pico and streams RTT output.
-- **`flip-link`**: The linker wrapper that places the stack at the bottom of RAM, so a stack overflow triggers a HardFault instead of silently corrupting data.
-- **`-Tlink.x`**: The cortex-m-rt linker script that sets up the vector table and memory sections.
-- **`-Tdefmt.x`**: The defmt linker script that sets up the logging framework's string table.
-- **`DEFMT_LOG`**: Sets the minimum log level (trace, debug, info, warn, error).
+- `target`: every `cargo build` cross-compiles for the Cortex-M0+, so you do not type `--target` each time.
+- `runner`: `cargo run` loads the program into the Pico and shows the RTT log lines.
+- `linker=flip-link`: links through the wrapper that protects your variables from a stack overflow.
+- `-Tlink.x`: the linker script from cortex-m-rt that places the vector table and the memory sections.
+- `-Tdefmt.x`: the linker script from defmt for its table of message texts.
+- `DEFMT_LOG`: the lowest log level that is kept (trace, debug, info, warn, error).
 
 ### build.rs
 
-Create `build.rs` in the project root to copy `memory.x` into the build output:
+Cargo runs `build.rs` on your computer before it compiles the project. This one copies `memory.x` to the folder where the linker looks for it:
 
 ```rust
 use std::env;
@@ -498,17 +486,19 @@ fn main() -> ! {
 
 ### Line-by-Line Walkthrough
 
-**`#![no_std]`** tells the compiler not to link the standard library. Microcontrollers do not have an operating system, so there is no heap allocator, file system, or networking stack. You get `core` (basic types, iterators, Option, Result) but not `std`.
+**`#![no_std]`** tells the compiler not to link the standard library, which needs an operating system (files, a network, a heap). You still have `core`: the basic types, including `Option` and `Result`, which appear below.
 
-**`#![no_main]`** tells the compiler that we provide our own entry point. The `#[entry]` attribute from `cortex-m-rt` generates the real entry point, which sets up the stack pointer and calls our function.
+**`#![no_main]`** says that the program supplies its own entry point. The `#[entry]` attribute from `cortex-m-rt` generates the real one, which sets the stack pointer and then calls our function.
 
-**`fn main() -> !`** returns the "never" type. Embedded main loops must never return, because there is no operating system to return to. If this function somehow returned, the runtime would enter an infinite loop.
+**`fn main() -> !`**: the `!` means this function never returns. There is no operating system to return to.
 
-**`pac::Peripherals::take()`** returns `Some(peripherals)` the first time it is called, and `None` on every subsequent call. This is the singleton pattern in Rust: it guarantees at compile time (through the type system) that only one part of your code can access the raw peripheral registers. In C, you simply write to peripheral addresses from anywhere, which enables subtle bugs when two modules configure the same peripheral differently.
+**`let` and `let mut`**: a variable cannot change unless it is declared with `mut`. This is the reverse of C, where you add `const` to forbid a change.
 
-**`pins.led.into_push_pull_output()`** consumes the pin in its unconfigured state and returns a new value with a different type representing a push-pull output. The original pin variable is no longer usable. This is the typestate pattern, and it means the compiler prevents you from reading a pin that is configured as an output or writing to a pin that is still unconfigured.
+**`pac::Peripherals::take().unwrap()`**: in C, any file can write to any peripheral register, so two modules can configure the same peripheral differently and neither knows. Rust closes this door with ownership: a value has one owner, and only the owner can use it. `take()` gives you the one value that stands for all the peripheral registers. It returns an `Option`, which is either `Some(peripherals)` or `None`. Think of a C pointer that may be NULL, with one difference: the compiler does not let you reach the contents until you say what happens for `None`. The first call returns `Some`, and every later call returns `None`. Here `.unwrap()` says "I am sure it is `Some`; panic if it is not".
 
-**`set_high().unwrap()`** returns `Result<(), Error>`. In embedded Rust, even simple GPIO operations return Results because the operation could theoretically fail (infallible implementations exist but the trait is generic). We call `unwrap()` here because RP2040 GPIO writes are infallible in practice.
+**`pins.led.into_push_pull_output()`**: in C, `gpio_put()` on a pin that was never made an output compiles and does nothing. Here the configuration of a pin is part of its type. `pins.led` starts as an unconfigured pin. `into_push_pull_output()` takes that value and gives back a new value of a different type, an output pin, and only that type has `set_high()`. The old `pins.led` cannot be used again. This is the typestate pattern: the state of the hardware is written in the type, so the compiler can refuse a wrong use.
+
+**`set_high().unwrap()`**: `set_high()` returns a `Result`, which is `Ok` if the operation worked and `Err` with a reason if it did not. It is a C error code that the compiler does not let you ignore without saying so. A GPIO write on the RP2040 cannot fail, but the `OutputPin` trait also serves chips where it can (a pin on an I2C port expander), so the return type stays. `unwrap()` takes the `Ok` and panics on an `Err`.
 
 ## Building and Flashing
 
@@ -521,15 +511,15 @@ fn main() -> ! {
 cargo build --release
 ```
 
-The first build downloads and compiles all dependencies. Subsequent builds are much faster. The output binary is at `target/thumbv6m-none-eabi/release/rp2040-blink`.
+The first build downloads and compiles all the crates. Later builds are much faster. The built program is the file `target/thumbv6m-none-eabi/release/rp2040-blink`.
 
-Check the binary size:
+Check the binary size (install the tool once with `cargo install cargo-binutils` and `rustup component add llvm-tools`):
 
 ```bash
 cargo size --release -- -A
 ```
 
-A minimal blink program typically uses 8-15 KB of flash. Compare this to a C blink compiled with the Pico SDK, which is similar in size. Rust does not add significant overhead for simple programs.
+This blink program uses about 3 KB of flash with the release profile above. A C blink built with the Pico SDK is also a few kilobytes, so the checks of Rust cost no flash here.
 
 ### Flash and Run
 
@@ -537,7 +527,7 @@ A minimal blink program typically uses 8-15 KB of flash. Compare this to a C bli
 cargo run --release
 ```
 
-This builds, flashes via probe-rs, and immediately starts streaming defmt RTT output to your terminal. You should see:
+This builds the program, loads it through probe-rs, and shows the defmt log lines in your terminal:
 
 ```
 INFO  Booting rp2040-blink
@@ -565,7 +555,7 @@ elf2uf2-rs target/thumbv6m-none-eabi/release/rp2040-blink
 # Copy the generated .uf2 file to the drive
 ```
 
-This method works but does not provide RTT log output. You lose the defmt messages. For serious development, a debug probe is essential.
+This method loads the program but gives no log lines, because RTT needs the probe. Without the log lines a fault takes much longer to find, so the rest of the course uses a probe.
 
 ## C vs Rust: What is Different?
 
@@ -596,7 +586,6 @@ int main() {
 - Nothing prevents calling `gpio_put()` with an invalid pin number (e.g., pin 99)
 - Nothing prevents two modules from calling `gpio_init()` on the same pin
 - `gpio_set_dir()` could be called with an incorrect direction and the compiler would not notice
-- If you forget `gpio_init()`, the code compiles and runs, but the pin does not work
 </TabItem>
 <TabItem label="Rust Blink (rp2040-hal)">
 ```rust
@@ -614,25 +603,22 @@ loop {
 **What Rust catches at compile time:**
 - `into_push_pull_output()` consumes the pin; you cannot configure it twice
 - `set_high()` only exists on output pin types; calling it on an input pin is a type error
-- `pins.led` is consumed after `into_push_pull_output()`; no other code can access it
 - Pin numbers are type-checked; there is no `gpio_put(99, 1)` equivalent
 - The peripheral singleton ensures `Pins::new()` can only be called once
 </TabItem>
 </Tabs>
 
-The key insight: in C, these are runtime bugs that show up during testing (or in the field). In Rust, they are compile-time errors. The compiler acts as a static analysis tool that understands hardware state.
+In C these mistakes compile, and you find them in testing or in the field. In Rust they do not compile. A compiler error costs a minute at your desk. The same mistake in a delivered product costs a visit to the site.
 
 ## defmt: Structured Logging for Embedded
 
 <InArticleAd />
 
 
-defmt (de-format) is a logging framework designed for resource-constrained targets. Unlike `printf`, which stores format strings in flash on the target, defmt stores only compact log frame IDs. The format strings stay on the host. This dramatically reduces flash usage and log overhead.
+defmt (deferred formatting) is a logging library for small chips. `printf` stores every format string in the chip's flash and builds the text on the chip. defmt puts only a small index for each message on the chip. The text stays in the ELF file on your computer, and probe-rs joins the two. The program uses less flash, and a log call takes less time.
 
 | Feature | printf (C) | defmt (Rust) |
 |---------|-----------|-------------|
-| Format string storage | On target (flash) | On host only |
-| Bandwidth per log | Full string over UART | Compact frame over RTT |
 | Structured data | No | Yes (derives, custom types) |
 | Log levels | Manual | Built-in (trace, debug, info, warn, error) |
 | Transport | Typically UART | RTT (through debug probe, zero pins used) |
@@ -688,28 +674,20 @@ defmt::info!("Sensor: {}", reading);
   - Embed.toml
 </FileTree>
 
-| File | Purpose |
-|------|---------|
-| `Cargo.toml` | Dependencies, features, optimization profiles |
-| `memory.x` | Linker script defining FLASH and RAM regions for the RP2040 |
-| `.cargo/config.toml` | Default target, linker flags, runner command |
-| `build.rs` | Build script that copies memory.x into the output directory |
-| `Embed.toml` | probe-rs configuration (chip, RTT, GDB settings) |
-| `src/main.rs` | Application code |
-| `Cargo.lock` | Exact dependency versions (auto-generated, commit to version control) |
+After a build, two entries are new. `target/` holds everything the compiler produced, and the program itself is the last file in the tree. `Cargo.lock` records the exact version of every crate that was used. Cargo writes it; keep it in version control so that every build uses the same versions.
 
 ### How the Build Works
 
 <Steps>
-1. **`cargo build`** invokes `rustc` with `--target thumbv6m-none-eabi`, cross-compiling for ARM Cortex-M0+.
+1. `cargo build` runs `build.rs` first, which copies `memory.x` to the folder where the linker looks for it.
 
-2. **`build.rs`** runs first, copying `memory.x` to the output directory so the linker can find it.
+2. Cargo then calls the compiler `rustc` with `--target thumbv6m-none-eabi`, so it produces code for the Cortex-M0+.
 
-3. **The linker** (`flip-link` wrapping `rust-lld`) combines your code with `cortex-m-rt`'s startup code, places sections according to `memory.x` and `link.x`, and generates an ELF binary.
+3. The linker (`flip-link`, which wraps `rust-lld`) joins your code with the startup code of `cortex-m-rt`, places the sections as `memory.x` and `link.x` say, and writes an ELF file.
 
-4. **`cargo run`** passes the ELF to `probe-rs run`, which flashes it to the Pico over SWD and resets the chip.
+4. `cargo run` passes the ELF file to `probe-rs run`, which loads it into the Pico over SWD and resets the chip.
 
-5. **RTT** starts streaming. probe-rs reads the defmt frames from a RAM buffer through the debug probe and decodes them on your machine using the format strings embedded in the ELF's debug info.
+5. RTT starts. probe-rs reads the defmt data from a RAM buffer through the debug probe and turns it into text on your computer, with the message texts stored in the ELF file (in its `.defmt` section, which is not loaded into the chip).
 </Steps>
 
 ## Production Notes
@@ -719,15 +697,15 @@ defmt::info!("Sensor: {}", reading);
 
 <Card title="Production Considerations" icon="setting">
 
-**Flash protection:** The RP2040 does not have read-out protection like STM32. Your firmware can be read back from the external QSPI flash. For commercial products, consider encrypting the firmware and using a signed boot flow.
+**Flash protection:** The RP2040 has no read-out protection of the kind an STM32 has. Anyone with the board can read your firmware from the flash chip. For a commercial product, consider encrypted firmware and a signed boot flow.
 
-**Panic behavior:** We use `panic-halt` which simply loops forever. In production, switch to `panic-probe` (logs the panic message over defmt then halts) during development, and `panic-reset` (triggers a watchdog reset) for deployed firmware.
+**Panic behavior:** `panic-halt` loops forever and says nothing. During development, use `panic-probe`, which prints the panic message over defmt and then stops. For delivered firmware, use `panic-reset`, which restarts the chip.
 
-**Binary size:** Run `cargo size --release -- -A` regularly. The `opt-level = "s"` profile optimizes for size. For even smaller binaries, try `opt-level = "z"`. LTO (`lto = "fat"`) in release mode enables cross-crate optimization.
+**Binary size:** The setting `opt-level = "s"` optimizes for size, and `opt-level = "z"` goes further.
 
-**Watchdog timer:** Production firmware should enable the watchdog timer to recover from hangs. The rp2040-hal `Watchdog` driver supports this. We will use it in later lessons.
+**Watchdog timer:** Delivered firmware should enable the watchdog timer, which restarts a program that hangs. The rp2040-hal `Watchdog` driver supports this.
 
-**flip-link justification:** On Cortex-M, the default stack grows downward from the top of RAM. If it overflows, it silently corrupts variables at the bottom of RAM. flip-link places the stack at the bottom, so an overflow triggers a HardFault that you can catch and log, instead of causing mysterious data corruption.
+**Why flip-link:** On Cortex-M the stack normally starts at the top of RAM and grows down toward the variables at the bottom. If it grows too far, it overwrites them and nothing reports it. With the stack at the bottom, an overflow leaves RAM, and the HardFault tells you what happened.
 </Card>
 
 ## What You Have Learned
@@ -754,13 +732,12 @@ defmt::info!("Sensor: {}", reading);
 - `defmt` structured logging over RTT
 
 **Build workflow:**
-- `cargo build --release` to cross-compile
-- `cargo run --release` to flash and stream logs
-- UF2 drag-and-drop as a fallback method
+- `cargo run --release` to build, flash and show logs
+- UF2 as a method without a probe
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 2: Ownership, Borrowing, and Hardware](/education/embedded-rust-rp2040/ownership-borrowing-hardware), you will explore how Rust's ownership model prevents entire categories of hardware bugs. You will build a button-toggled LED with software debouncing, learning typestate GPIO, error handling with Result, and safe shared resource access with Mutex and critical sections.
+In [Ownership, Borrowing, and Hardware](/education/embedded-rust-rp2040/ownership-borrowing-hardware/), you see how the ownership rules stop two parts of a program from using one pin. You build an LED that a button switches, with software debouncing, error handling with `Result`, and data shared safely with an interrupt.
 :::
 
 <EmbeddedRustRp2040Comments />

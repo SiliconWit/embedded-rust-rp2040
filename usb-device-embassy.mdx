@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-Most microcontrollers need a separate UART-to-USB bridge chip (an FTDI or CP2102) just to send serial data to a computer, and implementing USB device classes in C means hand-packing descriptor byte arrays where a single off-by-one error produces a device that silently fails to enumerate. The RP2040 has a built-in USB 1.1 controller with an integrated PHY, so it can act as a USB device without any external chip. Plug it into a computer and it can appear as a serial port, a keyboard, a mouse, or all of these at once. In this lesson you will use embassy-usb to build a USB CDC virtual serial port that streams sensor data, a USB HID keyboard that sends keystrokes when you press a button, and finally a composite device that combines both. The embassy-usb builder pattern makes descriptor construction type-safe, catching at compile time the layout errors that would take hours to debug with a protocol analyzer in C. #USB #EmbassyRust #HID
+You plug in a USB device you made and the computer shows "device not recognized", with no other message. The usual cause in C is one wrong byte in a descriptor, the table in which a device tells the computer what it is, and you find that byte only with a protocol analyzer. The RP2040 has a USB controller on the chip, so it needs no USB-to-serial bridge chip, and it can appear as a serial port, a keyboard or both at once. In this lesson you use embassy-usb, which builds the descriptors for you from a few calls. You make a virtual serial port that sends sensor readings, a keyboard that types when you press a button, and then one device that is both. #USB #EmbassyRust #HID
 
 ## What We Are Building
 
 <Card title="USB Composite Device: CDC Serial + HID Keyboard" icon="star">
-A Pico that appears as two USB devices simultaneously when plugged into a computer. The CDC interface acts as a virtual serial port that prints ADC readings from a potentiometer every 500 ms. The HID interface acts as a keyboard: pressing a button on the breadboard types a predefined string on the host computer. Both functions run as separate async tasks on the Embassy executor.
+A Pico that the computer sees as one USB device with two functions. The CDC function is a virtual serial port that prints the reading of a potentiometer every 500 ms. The HID function is a keyboard: a press of a button on the breadboard types a fixed text on the computer. Each function is an async task of its own on the Embassy executor.
 </Card>
 
 **Project specifications:**
@@ -61,25 +61,34 @@ A Pico that appears as two USB devices simultaneously when plugged into a comput
 <InArticleAd />
 
 
-The RP2040's USB controller supports USB 1.1 Full Speed (12 Mbit/s). It has 16 endpoints (including endpoint 0 for control transfers), double-buffered FIFOs for each endpoint, and handles all the low-level protocol signaling in hardware. The integrated PHY means the D+ and D- data lines connect directly to the chip with only a few passive components on the PCB (which the Pico board already provides).
+USB differs from UART in one way that explains everything else in this lesson: the two sides are not equal. The computer is the host and it starts every exchange. The Pico is a device and it only answers. A device that has data must wait until the host asks for it.
 
-When the Pico is plugged into a USB host, the following sequence occurs:
+Four words follow from this:
+
+- An endpoint is a numbered channel inside the device, with one direction. IN means from the device to the host, OUT means from the host to the device. The directions are always named from the side of the host.
+- Endpoint 0 is the control endpoint. Every device has it, and the host uses it to ask questions.
+- A descriptor is a block of bytes in which the device answers one of those questions: who made you, what are you, which endpoints do you have.
+- A class is an agreed kind of device (serial port, keyboard, storage). The operating system already has a driver for each class, so the device needs no driver of its own.
+
+The RP2040's controller works at USB 1.1 Full Speed (12 Mbit/s). It has 16 endpoint numbers (0 to 15, each usable in the IN and the OUT direction) and 4 kB of RAM for the endpoint buffers. The electrical part (the PHY) is on the chip, so the D+ and D- data lines go from the connector to the chip with only a few passive parts, which the Pico board already has.
+
+When you plug the Pico into a host, this happens:
 
 <Steps>
-1. The host detects the device by sensing the pull-up resistor on D+ (Full Speed indication).
+1. The host sees the device, because a pull-up resistor on the D+ line marks a Full Speed device.
 
-2. The host resets the bus and begins enumeration: it reads the device descriptor, configuration descriptor, and string descriptors through control transfers on endpoint 0.
+2. The host resets the bus and starts enumeration: it reads the descriptors through endpoint 0 and gives the device an address.
 
-3. Based on the descriptors, the host loads the appropriate class drivers. For CDC ACM, this is a virtual COM port driver. For HID, the operating system uses a built-in generic input driver.
+3. From the descriptors, the host chooses the class drivers: a serial port driver for CDC ACM, the built-in input driver for HID.
 
-4. The host sets the configuration (usually configuration 1), and the device is ready for data transfers on the class-specific endpoints.
+4. The host selects a configuration (usually configuration 1). Now the other endpoints can carry data.
 </Steps>
 
-Embassy's `embassy-usb` crate handles all of this automatically. You describe your device using a builder API, and the library generates the correct descriptors, manages endpoint allocation, and responds to host requests. Your application code only interacts with high-level class interfaces.
+The `embassy-usb` crate does this for you. You describe the device with a builder (an object that collects the parts in a few calls and then produces the finished device). The library writes the descriptors, gives out the endpoint numbers, and answers the host.
 
 ### USB Descriptor Hierarchy
 
-Every USB device describes itself through a tree of descriptors:
+The descriptors of a device form a tree with four levels:
 
 | Level | Descriptor | Purpose |
 |-------|-----------|---------|
@@ -88,21 +97,20 @@ Every USB device describes itself through a tree of descriptors:
 | 3 | Interface Descriptor | One function (HID, CDC, MSC, etc.) with its class codes |
 | 4 | Endpoint Descriptor | Communication pipe: direction, transfer type, packet size, polling interval |
 
-A composite device has multiple interfaces under one configuration. Our device will have three interfaces: two for CDC (communication + data) and one for HID.
+A composite device has several interfaces under one configuration. This device has three: two for CDC (one for commands, one for data) and one for HID. Bulk and Interrupt in the tree are transfer types: a bulk endpoint carries data of any amount when the bus has time, and an interrupt endpoint is asked by the host at a fixed interval.
 
 ```text
-  USB Descriptor Tree (Composite Device)
-  ──────────────────────────────────────────
   Device Descriptor
-  ├── VID: 0xCAFE, PID: 0x0001
+  ├── VID: 0xC0DE, PID: 0xCAFE
   └── Configuration 1 (max 100 mA)
       ├── Interface 0: CDC ACM (Communication)
       │   └── Endpoint 1 IN (Interrupt, 8 bytes)
       ├── Interface 1: CDC ACM (Data)
       │   ├── Endpoint 2 IN  (Bulk, 64 bytes)
-      │   └── Endpoint 2 OUT (Bulk, 64 bytes)
+      │   └── Endpoint 1 OUT (Bulk, 64 bytes)
       └── Interface 2: HID Keyboard
-          └── Endpoint 3 IN (Interrupt, 8 bytes)
+          ├── Endpoint 3 IN  (Interrupt, 8 bytes)
+          └── Endpoint 2 OUT (Interrupt, 8 bytes)
 ```
 
 ## Project Setup
@@ -120,7 +128,7 @@ edition = "2021"
 
 [dependencies]
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
+embassy-rp = { version = "0.3", features = ["time-driver", "critical-section-impl", "rp2040"] }
 embassy-usb = { version = "0.4" }
 embassy-time = { version = "0.4" }
 embassy-futures = { version = "0.1" }
@@ -163,6 +171,7 @@ opt-level = "s"
 fn main() {
     println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
+    println!("cargo:rustc-link-arg-bins=-Tlink-rp.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 }
 ```
@@ -195,9 +204,9 @@ DEFMT_LOG = "debug"
 <InArticleAd />
 
 
-USB CDC ACM (Communication Device Class, Abstract Control Model) creates a virtual serial port. On the host, it appears as `/dev/ttyACM0` on Linux, `COM3` on Windows, or `/dev/cu.usbmodem*` on macOS. Applications can open it just like a physical serial port and read/write data.
+USB CDC ACM (Communication Device Class, Abstract Control Model) is the class for a serial port that has no UART behind it. On the host it appears as `/dev/ttyACM0` on Linux, a port such as `COM3` on Windows, or `/dev/cu.usbmodem*` on macOS, and a program opens it as it opens any serial port. The baud rate you choose in the terminal has no effect, because no UART exists. The data travels at USB speed.
 
-Let's start with a standalone CDC example before building the composite device. This firmware reads the potentiometer via ADC and prints the value over the USB serial port every 500 ms.
+The first program is CDC alone. It reads the potentiometer with the ADC and prints the value on the USB serial port every 500 ms.
 
 ### Circuit Connections (CDC Only)
 
@@ -289,7 +298,7 @@ async fn main(spawner: Spawner) {
     // Main loop: read ADC and write to USB serial
     let mut buf = [0u8; 64];
     loop {
-        // Wait for the host to open the serial port
+        // Wait until the host has configured the device
         cdc.wait_connection().await;
         info!("CDC connected");
 
@@ -354,22 +363,26 @@ fn write_u32(buf: &mut [u8], val: u32) -> usize {
 }
 ```
 
-**How it works:** The `embassy_usb::Builder` constructs the USB device descriptor tree at initialization time. You pass in static buffers for the configuration descriptor, BOS (Binary Object Store) descriptor, and control endpoint buffer. The `CdcAcmClass::new()` call adds the CDC ACM interface (which internally creates two interfaces: the communication interface and the data interface, plus three endpoints). The builder handles all endpoint numbering and descriptor layout automatically.
+**How it works:** `embassy_usb::Builder` makes the descriptor tree when the program starts. It needs memory to write into, so you give it buffers for the configuration descriptor, the BOS descriptor (Binary Object Store, a second descriptor that newer hosts ask for) and the control endpoint. The buffers are `static`, because the USB task uses them for the whole run. `CdcAcmClass::new()` adds the two CDC interfaces and their three endpoints, and the builder chooses the numbers.
 
-The `usb_task` runs the USB stack in the background, handling enumeration, control transfers, and bus events. Your application code calls `cdc.wait_connection().await` to block until a host opens the serial port, then writes data with `cdc.write_packet()`. If the host closes the connection or unplugs the cable, `write_packet` returns an error and we loop back to waiting.
+The host can ask a question at any moment, so the USB stack needs a task of its own. `usb_task` answers the host during enumeration and afterwards. Your code and the USB task take turns at each `.await`:
+
+- `cdc.wait_connection().await` waits until the host has configured the device.
+- `cdc.write_packet(...).await` waits until the host has collected the packet.
+- If the cable is unplugged or the bus is reset, `write_packet` returns an error, and the code goes back to waiting for a connection.
 
 ## USB HID: Keyboard
 
 <InArticleAd />
 
 
-USB HID (Human Interface Device) covers keyboards, mice, gamepads, and other input devices. The key feature of HID is that it is self-describing: the HID report descriptor tells the host exactly how to interpret each byte of data. This is why HID devices work without custom drivers on every operating system.
+USB HID (Human Interface Device) is the class for keyboards, mice, gamepads and other input devices. A HID device sends reports: small packets of fixed size that give its state now (which keys are down, how far the mouse moved). It also sends, once, a report descriptor that tells the host what each bit of a report means. This is why a HID device works on every operating system with no driver of its own.
 
-For our keyboard, each button press sends a "key down" report followed by a "key up" report. The HID report descriptor defines the keyboard layout according to the USB HID Usage Tables specification.
+A keyboard report says which keys are down at this moment. It does not say "a key was pressed". So one key press needs two reports: one with the key down, and one with no key down. Without the second report the host believes that the key is still held.
 
 ### HID Report Descriptor
 
-The report descriptor defines a standard keyboard with modifier keys and a 6-key rollover array:
+This report descriptor defines a standard keyboard: 8 modifier keys (Ctrl, Shift, Alt, GUI, left and right) and room for 6 ordinary keys held together:
 
 ```rust
 // Standard keyboard report descriptor
@@ -410,7 +423,13 @@ const KEYBOARD_REPORT_DESC: &[u8] = &[
 ];
 ```
 
-The report is 8 bytes total. Byte 0 holds modifier flags (one bit each for Left Ctrl, Left Shift, Left Alt, Left GUI, Right Ctrl, Right Shift, Right Alt, Right GUI). Byte 1 is reserved padding. Bytes 2 through 7 hold up to 6 simultaneous key codes. A key code of 0x00 means "no key" in that slot.
+The descriptor is read in pairs: "Report Size" is the number of bits in one field, "Report Count" is the number of such fields, and "Input" closes the group. So the three groups are 8 fields of 1 bit, 1 field of 8 bits and 6 fields of 8 bits, which gives a report of 8 bytes:
+
+| Byte | Content |
+|------|---------|
+| 0 | Modifier flags, one bit per key: Left Ctrl, Left Shift, Left Alt, Left GUI, then the same four on the right |
+| 1 | Reserved, always 0 |
+| 2 to 7 | Up to 6 key codes. 0x00 means "no key" in that place |
 
 ### Keyboard Report Structure
 
@@ -453,7 +472,7 @@ impl KeyboardReport {
 
 ### USB HID Key Codes
 
-The USB HID specification assigns a numeric code to each key. These codes are independent of the keyboard layout; the operating system maps them to characters based on the active language setting. Common codes:
+A keyboard does not send characters. It sends the number of a key, as the key is placed on a US keyboard, and the operating system chooses the character from its own layout setting. The same code 0x1C gives "y" on a computer set to a US layout and "z" on one set to a German layout. Common codes:
 
 | Key | HID Code | Key | HID Code |
 |-----|----------|-----|----------|
@@ -465,14 +484,14 @@ The USB HID specification assigns a numeric code to each key. These codes are in
 | L | 0x0F | Comma | 0x36 |
 | O | 0x12 | Exclamation | Shift + 0x1E |
 
-To type the letter "H", you send a report with keycode 0x0B. To type uppercase "H", you set the Shift modifier bit (bit 1 of the modifier byte = 0x02) along with the keycode.
+To type "h" you send a report with key code 0x0B. To type "H" you send the same key code and set the Left Shift bit (bit 1 of the modifier byte, value 0x02), as a person holds Shift.
 
 ## Composite Device: CDC + HID
 
 <InArticleAd />
 
 
-Now we combine both classes into a single USB device. The Pico appears as both a serial port and a keyboard simultaneously. This is the complete project firmware.
+The complete project puts both classes into one USB device.
 
 ### Circuit Connections
 
@@ -483,7 +502,7 @@ Now we combine both classes into a single USB device. The Pico appears as both a
 | GND | Button other leg, pot end | Ground |
 | 3V3 | Potentiometer end | Reference voltage |
 
-The button connects between GP15 and GND. We enable the internal pull-up resistor, so the pin reads high when released and low when pressed.
+The button connects GP15 to GND. The code turns on the internal pull-up resistor, so the pin reads high when the button is released and low when it is pressed. The 10K resistor of the parts list is not used.
 
 ### Complete Firmware
 
@@ -676,8 +695,8 @@ async fn hid_task(
 ) {
     let (reader, mut writer) = hid.split();
 
-    // We only use the writer; spawn a task to drain the reader
-    // so the host does not stall on SET_REPORT/OUTPUT reports.
+    // We only use the writer. The report descriptor defines no
+    // output reports, so the reader is kept but never read.
     let _reader = reader;
 
     // The string to type when the button is pressed
@@ -835,20 +854,36 @@ async fn main(spawner: Spawner) {
 
 ### How the Composite Device Works
 
-**Three concurrent tasks:** The Embassy executor runs three tasks. `usb_task` handles the USB protocol stack (enumeration, control transfers, bus events). `cdc_task` reads the potentiometer and writes formatted text to the CDC serial interface. `hid_task` waits for button presses and sends keyboard reports. All three run concurrently on the single-threaded async executor, yielding at every `.await` point.
+**Three tasks:** `usb_task` answers the host. `cdc_task` reads the potentiometer and writes text to the serial port. `hid_task` waits for the button and sends keyboard reports. Only one of them runs at any moment, and each gives the processor back at every `.await`. Each task owns its own hardware (the ADC, the button pin), so no lock is needed.
 
-**Builder pattern:** The `embassy_usb::Builder` allocates endpoints and constructs descriptors in the correct order. When you call `CdcAcmClass::new()`, the builder internally adds two interfaces (communication + data) and three endpoints (notification IN, data IN, data OUT). When you call `HidReaderWriter::new()`, it adds one interface with one interrupt IN endpoint and one interrupt OUT endpoint. The builder handles all the byte-level descriptor layout, endpoint numbering, and interface numbering. You never touch a raw descriptor byte.
+**The host sets the pace:** `poll_ms: 10` asks the host to collect a keyboard report every 10 ms. `writer.write(...).await` finishes when the host has taken the report, not when the task wants. The drawing follows one character:
 
-**Composite class codes:** The device descriptor uses class 0xEF (Miscellaneous), subclass 0x02, protocol 0x01. This tells the host to look for Interface Association Descriptors (IADs) in the configuration descriptor, which group the CDC interfaces together. Without these class codes, some operating systems (Windows in particular) would not correctly recognize the CDC interface in a composite device.
+```text
+ time (ms)  0    10   20   30   40   50   60
+            │    │    │    │    │    │    │
+ host asks  ?    ?    ?    ?    ?    ?    ?
+ hid_task   █....█....█....█..............█
+            a    b    c    d              e
+```
 
-**Keyboard typing:** The `hid_task` converts each ASCII character to a HID keycode, sends a key-down report (with the keycode in slot 0 and optionally the Shift modifier), waits 10 ms, then sends a key-up report (all zeros). The 30 ms delay between characters prevents the host from merging reports or dropping keys. The 300 ms debounce delay after the full string prevents accidental double-triggers.
+- a: the button is pressed. The task writes "key down" and waits for the host.
+- b: the host took the report. The task waits 10 ms.
+- c: the task writes "key up" (the empty report) and waits for the host.
+- d: the host took it. The task waits 30 ms.
+- e: the task writes "key down" for the next character.
+
+At every dot the other two tasks can run. While the task types, and for 300 ms after the text, it does not wait for the button, so a press in that time is ignored. This also covers contact bounce.
+
+**The builder:** `CdcAcmClass::new()` adds two interfaces and three endpoints. `HidReaderWriter::new()` adds one interface with one interrupt IN and one interrupt OUT endpoint. The builder chooses every number.
+
+**Composite class codes:** The device descriptor uses class 0xEF (Miscellaneous), subclass 0x02, protocol 0x01. This tells the host to look for Interface Association Descriptors (IADs), which mark the two CDC interfaces as one function. Without these codes some operating systems, Windows in particular, do not recognize the CDC part of a composite device.
 
 ## C vs Rust: USB Descriptor Construction
 
 <InArticleAd />
 
 
-In C with TinyUSB, USB descriptors are raw byte arrays. Every field position, length, and value must be correct or the device will fail to enumerate. Here is a typical TinyUSB configuration descriptor for a composite CDC+HID device:
+In C with TinyUSB you write the descriptors as arrays of bytes. Every position, length and value must be correct, or the host rejects the device. A typical TinyUSB configuration descriptor for a composite CDC+HID device:
 
 ```c title="C with TinyUSB (error-prone)"
 // Must manually calculate CONFIG_TOTAL_LEN
@@ -869,7 +904,7 @@ Common mistakes with this approach:
 - Byte order errors in multi-byte fields
 - Mismatched HID report descriptor length
 
-With embassy-usb in Rust, none of these errors are possible:
+With embassy-usb you do not write these numbers, so you cannot write them wrong:
 
 ```rust title="Rust with embassy-usb (type-safe)"
 let mut builder = embassy_usb::Builder::new(driver, config, ...);
@@ -885,7 +920,7 @@ let hid = HidReaderWriter::new(&mut builder, hid_state, hid_config);
 let usb = builder.build(); // Finalizes CONFIG_TOTAL_LEN automatically
 ```
 
-The builder pattern eliminates the entire category of descriptor construction bugs. Interface numbers, endpoint numbers, and descriptor lengths are computed automatically. If you try to allocate more endpoints than the hardware supports, you get a compile-time error (or a clear panic at initialization), not a silent enumeration failure.
+The builder calculates the interface numbers, the endpoint numbers and the lengths. If you ask for more endpoints than the hardware has, the program stops with a clear panic message at startup. The host does not reject the device without a reason.
 
 ## Building and Flashing
 
@@ -915,9 +950,9 @@ The builder pattern eliminates the entire category of descriptor construction bu
    ```
    Then hold BOOTSEL while plugging in the Pico, and run:
    ```bash
-   elf2uf2-rs target/thumbv6m-none-eabi/release/usb-composite
+   elf2uf2-rs -d target/thumbv6m-none-eabi/release/usb-composite
    ```
-   The tool finds the mounted RPI-RP2 drive and copies the firmware automatically.
+   With the `-d` (deploy) option the tool finds the mounted RPI-RP2 drive and copies the firmware automatically.
 
 5. After flashing, the Pico reboots and enumerates as a composite USB device.
 </Steps>
@@ -926,6 +961,8 @@ The builder pattern eliminates the entire category of descriptor construction bu
 
 <InArticleAd />
 
+
+The Pico types into whichever window has the keyboard focus. Click in an empty text editor before you press the button, and test only on your own computer.
 
 <Tabs>
 <TabItem label="Linux">
@@ -990,24 +1027,22 @@ The builder pattern eliminates the entire category of descriptor construction bu
 | Keyboard types wrong characters | Keycode mapping error | Check `ascii_to_hid()` against the USB HID Usage Tables |
 | Button press types multiple times | Debounce too short | Increase the 300 ms debounce delay |
 | ADC reads stuck at 0 | Wiring issue | Verify potentiometer wiper connects to GP26, ends to 3V3 and GND |
-| Firmware panics on startup | Endpoint allocation failed | RP2040 supports 16 endpoints; composite device uses 7 (well within limits) |
+| Firmware panics on startup | Endpoint allocation failed | RP2040 supports 16 endpoint numbers in each direction; the composite device uses 7 endpoints, counting the two control endpoints (well within limits) |
 
 ## Production Notes
 
 <InArticleAd />
 
 
-If you plan to build a product around USB on the RP2040, keep these points in mind:
+**Vendor and product IDs:** The IDs 0xc0de:0xcafe of this lesson are for development only. A product needs a vendor ID from the USB Implementers Forum (USB-IF), or a product ID from a shared program such as pid.codes, which gives free product IDs under vendor ID 0x1209.
 
-**USB Vendor and Product IDs:** The IDs 0xc0de:0xcafe used in this lesson are for development only. For a real product, you must obtain a vendor ID from the USB Implementers Forum (USB-IF) or use a shared vendor ID program like pid.codes (which provides free product IDs under vendor ID 0x1209).
+**Compliance testing:** A consumer USB device should pass the USB-IF compliance tests. Embassy-usb answers the required standard requests. If you add requests of your own, test them with the USB Command Verifier (USB CV) tool.
 
-**USB compliance testing:** Consumer USB devices should pass the USB-IF compliance tests. The RP2040's USB controller is compliant at the silicon level, but your firmware must handle all standard requests correctly. Embassy-usb handles the mandatory requests, but if you add vendor-specific functionality, test thoroughly with the USB Command Verifier (USB CV) tool.
+**String descriptors:** Give real manufacturer, product and serial number strings. The serial number should differ for every unit. You can make it from the unique ID of the flash chip (through `embassy_rp::flash`).
 
-**String descriptors:** Include meaningful manufacturer, product, and serial number strings. The serial number should be unique per device. You can derive it from the RP2040's unique flash ID (accessible through `embassy_rp::flash`).
+**Power:** Declare the true current in `max_power`. USB 2.0 allows up to 500 mA per port, but some hubs and laptops give less.
 
-**Power descriptors:** The `max_power` field in the USB configuration tells the host how much current the device draws. If your device draws more than 100 mA, you must declare it. USB 2.0 allows up to 500 mA per port, but some hubs and laptops limit current on unpowered ports.
-
-**Suspend and resume:** USB devices are required to enter a low-power state when the host suspends the bus (e.g., when the computer sleeps). Embassy-usb handles the protocol, but you should also reduce your application's power consumption during suspend. The `UsbDevice` provides a `suspended()` method to check the current state.
+**Suspend and resume:** A USB device must use little power when the host suspends the bus, for example when the computer sleeps. To lower the power use of your own code, implement the `suspended()` callback of the `embassy_usb::Handler` trait and register it with `builder.handler()`.
 
 ## Experiments
 
@@ -1033,7 +1068,7 @@ Embassy-usb does not include a built-in MSC (Mass Storage Class) driver, but the
 <InArticleAd />
 
 
-You built a USB composite device on the RP2040 using embassy-usb in Rust. The device combines a CDC ACM virtual serial port (streaming potentiometer readings) with an HID keyboard (typing text on button press). Embassy's builder pattern constructs all USB descriptors automatically, eliminating the raw byte arrays and manual length calculations required in C with TinyUSB. Three async tasks run concurrently on the Embassy executor: the USB stack, the CDC serial task, and the HID keyboard task. Each task owns its peripherals exclusively, with no shared mutable state and no locks. The device enumerates correctly on Windows, macOS, and Linux without custom drivers.
+On USB the host starts every exchange and the device answers through numbered endpoints. A device tells the host what it is with descriptors, and a class such as CDC or HID lets it use a driver that the operating system already has. You built a composite device: a CDC serial port that sends potentiometer readings and a HID keyboard that types on a button press. The embassy-usb builder wrote the descriptors. A keyboard report gives the keys that are down now, as key numbers and not as characters, so each key press is two reports. Three tasks share the processor, and each owns its hardware, so the program has no locks.
 
 <EmbeddedRustRp2040Comments />
 

@@ -21,16 +21,14 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
   contributors={frontmatter.contributors}
 />
 
-
-
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-A sensor node tethered to USB can only report data to the machine it is plugged into. Adding Wi-Fi lets it publish readings to any MQTT broker on the network, but networking on a microcontroller without an OS means you need a TCP/IP stack, a Wi-Fi driver, and an async runtime that can juggle socket I/O alongside sensor reads without blocking either one. Embassy provides all three in Rust: the `cyw43` crate drives the Pico W's wireless chip, `embassy-net` handles TCP/IP, and the async executor keeps everything running concurrently on a single core. In this lesson you will connect to Wi-Fi, open TCP sockets, send a raw HTTP request, and build an MQTT sensor node that publishes BME280 readings every 10 seconds with automatic reconnection. #PicoW #EmbassyNet #MQTT
+A sensor that reports only over a USB cable is useful to one computer, the one it is plugged into. Wi-Fi removes the cable, and brings a new kind of failure: the router restarts, the signal fades, the server is down, and a board that waits for a network reply can wait for ever. A program that handles this in C is a net of callbacks and state variables. In Rust with Embassy each network wait is an `.await`, so the radio driver, the network stack and your sensor code take turns on one processor, and a lost connection is an ordinary error value. In this lesson you join a Wi-Fi network, open a TCP connection, send a raw HTTP request, and build a sensor node that publishes BME280 readings by MQTT every 10 seconds and connects again after a failure. #PicoW #EmbassyNet #MQTT
 
 ## What We Are Building
 
 <Card title="MQTT Sensor Node with BME280" icon="star">
-A Pico W that connects to Wi-Fi, reads temperature, humidity, and pressure from a BME280 sensor over I2C every 10 seconds, formats the data as JSON, and publishes it to an MQTT broker. The firmware handles Wi-Fi disconnection and broker reconnection gracefully using async patterns. A status LED blinks to indicate the current connection state.
+A Pico W joins a Wi-Fi network, reads temperature, humidity and pressure from a BME280 sensor over I2C every 10 seconds, formats the reading as JSON, and publishes it to an MQTT broker (the server that passes messages on). When the broker connection fails, the firmware waits and tries again. A status LED shows the connection state.
 </Card>
 
 **Project specifications:**
@@ -62,10 +60,9 @@ A Pico W that connects to Wi-Fi, reads temperature, humidity, and pressure from 
 
 <InArticleAd />
 
+The RP2040 has no radio. On the Pico W a second chip, the CYW43439, does the Wi-Fi work. It sits under the metal shield on the board and talks to the RP2040 over an SPI bus on pins GP23, GP24, GP25 and GP29. These four pins do not go to the board header, so Wi-Fi takes none of the pins you use for your own parts.
 
-The CYW43439 wireless chip sits on the back of the Pico W board. It communicates with the RP2040 over an SPI bus that uses dedicated pins (not the general-purpose GPIO). This means Wi-Fi does not consume any of the GPIO pins available for your own peripherals.
-
-One important change from the standard Pico: the onboard LED is routed through the CYW43 chip. You cannot control it with a simple GPIO write. Instead, the cyw43 driver provides a method to set the LED state. In Embassy, this looks like `control.gpio_set(0, true).await` where GPIO 0 on the CYW43 is the onboard LED.
+One thing changes from the standard Pico: the onboard LED is wired to the CYW43 chip, not to an RP2040 pin. You cannot switch it with a GPIO write. You ask the driver: `control.gpio_set(0, true).await`, where GPIO 0 of the CYW43 is the onboard LED.
 
 ### Pico W vs Standard Pico
 
@@ -78,12 +75,11 @@ One important change from the standard Pico: the onboard LED is routed through t
 | CYW43 firmware | N/A | Must be included in binary |
 | Power consumption | ~25 mA active | ~45 mA idle, ~300 mA peak TX |
 
-The CYW43439 requires firmware that is loaded by the driver at boot time. In the Rust ecosystem, the `cyw43-firmware` crate includes the firmware blob. The driver loads it over SPI during initialization, which takes about 200 ms.
+The CYW43439 has no program of its own when power arrives. Its firmware (a file of machine code for the radio chip, often called a blob) is part of your binary, supplied by the `cyw43-firmware` crate. The driver sends it to the chip over SPI at every start, which takes about 200 ms.
 
 ## Project Setup
 
 <InArticleAd />
-
 
 ### Cargo.toml
 
@@ -94,16 +90,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
-embassy-net = { version = "0.6", features = ["tcp", "dns", "dhcpv4", "medium-ethernet"] }
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-32768"] }
+embassy-rp = { version = "0.3", features = ["time-driver", "critical-section-impl", "rp2040"] }
+embassy-net = { version = "0.6", features = ["defmt", "tcp", "dns", "dhcpv4", "medium-ethernet"] }
 embassy-time = { version = "0.4" }
 embassy-futures = { version = "0.1" }
 embassy-sync = { version = "0.6" }
 
-cyw43 = { version = "0.4" }
-cyw43-pio = { version = "0.4", features = ["overclock"] }
-cyw43-firmware = { version = "0.4" }
+cyw43 = { version = "0.3" }
+cyw43-pio = { version = "0.3" }
+cyw43-firmware = { version = "0.1", features = ["wifi"] }
+
+embedded-hal-async = "1.0"
+embedded-io-async = "0.6"
+rand_core = "0.6"
 
 defmt = "0.3"
 defmt-rtt = "0.4"
@@ -140,6 +140,7 @@ opt-level = "s"
 fn main() {
     println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
+    println!("cargo:rustc-link-arg-bins=-Tlink-rp.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 }
 ```
@@ -171,44 +172,49 @@ DEFMT_LOG = "debug"
 
 <InArticleAd />
 
+A board is on the network only when three separate things are true, and each can fail alone:
 
-The cyw43 driver initializes the wireless chip, loads its firmware, and provides an async interface for scanning, connecting, and managing the Wi-Fi link. The `embassy-net` crate sits on top, providing TCP sockets, DNS resolution, and DHCP.
+- The access point (the Wi-Fi router) has accepted the board. This is what "connected" means on Wi-Fi, and nothing more.
+- The board has an IP address. A service of the router named DHCP gives it one.
+- The server you want can be reached at its address and port.
+
+Two crates do this work. The `cyw43` driver starts the radio chip and joins the network. `embassy-net` is the TCP/IP stack: the code that turns "send these bytes to that address" into packets, and packets back into bytes. It also does DHCP and DNS.
+
+Both must keep working while your own code waits, so each one has a task of its own that runs for ever. Your code never calls them. It awaits, and they run:
+
+```text
+             one call: socket.connect(...).await
+ main task   █..................................█
+ net_task    .█.......................█..........
+ cyw43_task  ..█.....................█...........
+              ││                     ││
+              │└ radio sends it      │└ stack reads it
+              └ stack makes a packet └ radio gets the reply
+
+ █ the task runs      . the task waits at an .await
+```
+
+If your task calculates for a long time with no `.await`, these two tasks do not run, and the network stops with it.
 
 ### Initialization Sequence
 
-Bringing up Wi-Fi on the Pico W involves several steps:
-
 <Steps>
-1. Configure the PIO and SPI pins that connect the RP2040 to the CYW43439.
+1. Configure the PIO pins that connect the RP2040 to the CYW43439.
 
-2. Create the cyw43 driver, passing it the firmware blob from the `cyw43-firmware` crate.
+2. Create the cyw43 driver and give it the firmware from the `cyw43-firmware` crate.
 
-3. Spawn the cyw43 background task, which handles interrupts and SPI communication.
+3. Spawn the cyw43 background task, which moves data between the two chips.
 
-4. Use `control.join_wpa2()` to connect to a Wi-Fi network.
+4. Create an `embassy-net` stack with DHCP, and spawn its task, which handles packets.
 
-5. Create an `embassy-net` stack with DHCP, which obtains an IP address automatically.
+5. Call `control.join()` with the network name and password. `Ok` means that the access point accepted the board.
 
-6. Spawn the network stack task, which processes packets in the background.
+6. Wait until DHCP has given the board an IP address. Only now can you open a connection.
 </Steps>
-
-```mermaid
-%%{init: {'flowchart': {'curve': 'linear'}}}%%
-stateDiagram-v2
-    [*] --> ConfigPins : PIO + SPI pins
-    ConfigPins --> LoadFirmware : Create cyw43 driver
-    LoadFirmware --> BackgroundTask : Spawn cyw43 task
-    BackgroundTask --> Joining : control.join_wpa2()
-    Joining --> Connected : WPA2 handshake OK
-    Joining --> Joining : Retry after backoff
-    Connected --> DHCPWait : Start DHCP
-    DHCPWait --> Ready : IP assigned
-    Ready --> [*]
-```
 
 ### Standalone Wi-Fi Example
 
-Before building the MQTT sensor node, let's get Wi-Fi working with a minimal example that connects and prints the assigned IP address:
+Start with a program that only joins the network and prints the IP address it was given. Put your own network name and password in the two constants on your own machine. Never commit real credentials to a repository or paste them into a question.
 
 ```rust title="src/main.rs (Wi-Fi connect only)"
 #![no_std]
@@ -226,7 +232,9 @@ use embassy_rp::pio::{InterruptHandler as PioIrq, Pio};
 use embassy_net::{Config as NetConfig, StackResources};
 use embassy_time::{Duration, Timer};
 
-use cyw43_pio::PioSpi;
+use cyw43::JoinOptions;
+use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
+use rand_core::RngCore;
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
@@ -255,8 +263,8 @@ async fn main(spawner: Spawner) {
 
     // ── CYW43 Initialization ───────────────────────────────────────
 
-    let fw = cyw43_firmware::firmware();
-    let clm = cyw43_firmware::clm();
+    let fw = cyw43_firmware::CYW43_43439A0;
+    let clm = cyw43_firmware::CYW43_43439A0_CLM;
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -265,6 +273,7 @@ async fn main(spawner: Spawner) {
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
+        DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
@@ -279,7 +288,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(cyw43_task(runner)).unwrap();
 
     control.init(clm).await;
-    control.set_power_management(cyw43::PowerManagement::PowerSave).await;
+    control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
 
     // ── Network Stack ──────────────────────────────────────────────
 
@@ -288,14 +297,17 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
-    let (stack, runner) = embassy_net::new(net_device, net_config, resources, embassy_rp::clocks::RoscRng);
+    // Random seed for the stack (TCP sequence numbers, local ports)
+    let seed = embassy_rp::clocks::RoscRng.next_u64();
+
+    let (stack, runner) = embassy_net::new(net_device, net_config, resources, seed);
     spawner.spawn(net_task(runner)).unwrap();
 
     // ── Connect to Wi-Fi ───────────────────────────────────────────
 
     info!("Connecting to Wi-Fi: {}", WIFI_SSID);
     loop {
-        match control.join_wpa2(WIFI_SSID, WIFI_PASS).await {
+        match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASS.as_bytes())).await {
             Ok(_) => {
                 info!("Wi-Fi connected");
                 break;
@@ -330,21 +342,27 @@ async fn main(spawner: Spawner) {
 }
 ```
 
-**How it works:** The cyw43 driver uses PIO (Programmable I/O) to communicate with the CYW43439 over SPI. The `PioSpi` struct configures PIO state machine 0 on PIO0 to run the SPI protocol, freeing the RP2040's hardware SPI peripherals for your own use. Pin 23 is the power enable for the CYW43, pin 25 is SPI chip select, pin 24 is SPI data, and pin 29 is SPI clock. These are fixed on the Pico W PCB.
+**How it works:** The driver talks to the CYW43439 through PIO (programmable I/O), a block of the RP2040 that runs a small program to produce a signal protocol on pins. `PioSpi` makes state machine 0 of PIO0 speak SPI, so both hardware SPI blocks stay free for you. The four pins are fixed on the Pico W board: GP23 switches the power of the CYW43, GP25 is the chip select, GP24 is the data line and GP29 is the clock.
 
-The `cyw43::new()` function loads the firmware blob into the wireless chip and returns three things: a network device (implements the `embassy-net` driver trait), a control handle (for Wi-Fi management and GPIO control), and a runner (background task that pumps the SPI bus). The runner must be spawned as a task; it runs forever, handling interrupts and data transfer between the RP2040 and the CYW43.
+`cyw43::new()` loads the firmware into the radio chip and returns three things:
+
+- a network device, which `embassy-net` uses to send and receive packets,
+- a control handle, for joining a network and for the LED,
+- a runner, which you must spawn as a task. It runs for ever and moves the data between the RP2040 and the CYW43.
+
+The `static ... StaticCell` lines give the driver and the stack memory that exists for the whole run, because their tasks never end.
 
 ## TCP Client and HTTP GET
 
 <InArticleAd />
 
-
-With the network stack running, you can open TCP connections to remote servers. Let's make an HTTP GET request to demonstrate raw TCP networking. This is not how you would build a production HTTP client, but it shows exactly what happens at the TCP layer.
+TCP gives you a connection between two programs: bytes go in at one end and come out at the other, in order, and lost packets are sent again. A socket is your end of one such connection. An HTTP GET request by hand shows what travels over it. A product would use an HTTP library, but here every byte is visible.
 
 ### Manual HTTP GET
 
 ```rust
 use embassy_net::tcp::TcpSocket;
+use embedded_io_async::Write; // provides write_all()
 
 async fn http_get(stack: embassy_net::Stack<'static>) {
     let mut rx_buf = [0u8; 4096];
@@ -392,11 +410,11 @@ async fn http_get(stack: embassy_net::Stack<'static>) {
 }
 ```
 
-This function creates a TCP socket with 4 KB buffers for send and receive. The `connect()` call performs the TCP three-way handshake. Then we write a raw HTTP/1.1 GET request and read the response in a loop until the server closes the connection (indicated by `Ok(0)`).
+The function makes a TCP socket with two 4 KB buffers. `connect()` opens the connection. Then the code writes an HTTP/1.1 GET request as plain text and reads the reply until the server closes the connection, which `read` reports as `Ok(0)`. The timeout of 10 seconds matters: without it, a server that stops answering would hold this task at an `.await` for ever.
 
 ### DNS Resolution
 
-Hardcoding IP addresses is not practical. Embassy-net includes a DNS resolver that works with the DHCP-provided DNS server:
+The address in the listing is typed by hand, and a public server can change its address at any time. DNS turns a name such as `httpbin.org` into the current address. `embassy-net` asks the DNS server that DHCP named:
 
 ```rust
 use embassy_net::dns::DnsQueryType;
@@ -415,14 +433,13 @@ async fn resolve_host(stack: embassy_net::Stack<'static>, hostname: &str) {
 }
 ```
 
-The `dns_query` method sends a DNS query to the server provided by DHCP and returns the resolved IP addresses. You can use this to look up your MQTT broker's hostname before connecting.
-
 ## MQTT Protocol Overview
 
 <InArticleAd />
 
+A sensor node should not need to know who reads its data. MQTT solves this with a server in the middle, the broker. Think of a notice board with named sections. The sensor pins a note in the section `sensors/pico-w/bme280` (it publishes to that topic), and anyone who has asked for that section (a subscriber) gets a copy. The sensor and the reader never meet. MQTT runs over TCP and its packets are small, which suits a microcontroller.
 
-MQTT (Message Queuing Telemetry Transport) is a lightweight publish/subscribe protocol designed for constrained devices and unreliable networks. It runs over TCP and uses a broker as an intermediary. Clients connect to the broker, publish messages to topics, and subscribe to topics to receive messages from other clients.
+The comparison stops at one point: a notice stays on a board, but a subscriber that is offline when a message passes does not get it later.
 
 ### MQTT Packet Types
 
@@ -437,7 +454,7 @@ MQTT (Message Queuing Telemetry Transport) is a lightweight publish/subscribe pr
 | PINGRESP | Broker to Client | Respond to keep-alive |
 | DISCONNECT | Client to Broker | Close the session cleanly |
 
-For our sensor node, we only need CONNECT, CONNACK, PUBLISH, PINGREQ, and PINGRESP. We will implement a minimal MQTT 3.1.1 client directly on TCP, which gives full visibility into how the protocol works. In production, you would use a crate like `rust-mqtt`, but understanding the wire format is valuable.
+The sensor node needs only CONNECT, CONNACK, PUBLISH, PINGREQ and PINGRESP. You write a small MQTT 3.1.1 client directly on TCP, so that every byte of the protocol is visible. A product would use a crate such as `rust-mqtt`.
 
 ### MQTT Packet Format
 
@@ -448,17 +465,18 @@ Every MQTT packet starts with a fixed header:
 | 0 | Packet type + flags | Upper 4 bits = packet type, lower 4 bits = flags |
 | 1+ | Remaining length | Variable-length encoding (1 to 4 bytes) |
 
-The remaining length uses a variable-length encoding where each byte contributes 7 bits of value and 1 continuation bit. For packets under 128 bytes, the remaining length is a single byte.
+The remaining length is the number of bytes that follow it. Each length byte carries 7 bits of the number, and its top bit says "one more length byte follows". A length up to 127 fits in one byte. A length of 173 needs two: `0xAD` (45, with the top bit set) and `0x01`, because 45 + 1 × 128 = 173.
 
 ## Minimal MQTT Client in Rust
 
 <InArticleAd />
 
-
-We will build a small MQTT client module that handles connection, publishing, and keep-alive. This is intentionally minimal to fit in a single file while demonstrating the protocol.
+The client below does three things: it opens a session, it publishes, and it keeps the session alive. The broker closes a session that is silent for longer than the keep-alive time (60 seconds here), so a client with nothing to say sends a PINGREQ.
 
 ```rust title="MQTT client module (included in main.rs)"
 // ── Minimal MQTT 3.1.1 Client ──────────────────────────────────────
+
+use embedded_io_async::{Read, Write}; // provide read_exact() and write_all()
 
 struct MqttClient<'a> {
     socket: TcpSocket<'a>,
@@ -599,7 +617,7 @@ fn encode_remaining_length(buf: &mut [u8], mut len: usize) -> usize {
     pos
 }
 
-#[derive(Debug)]
+#[derive(Debug, defmt::Format)]
 enum MqttError {
     WriteError,
     ReadError,
@@ -608,20 +626,23 @@ enum MqttError {
 }
 ```
 
-The `MqttClient` struct wraps a TCP socket and provides three operations: `connect` (establishes an MQTT session), `publish` (sends a message to a topic at QoS 0), and `ping` (keeps the connection alive). QoS 0 means "fire and forget." The broker does not acknowledge receipt, which keeps the implementation simple and the bandwidth low. For sensor data that is published frequently, QoS 0 is usually sufficient because a single lost reading is insignificant.
+`publish` uses QoS 0. QoS (quality of service) is the MQTT word for how hard the two sides try to deliver a message, and level 0 means "send once, ask for no answer". So read the result of `publish` with care. `Ok` means that the bytes were handed to the TCP stack on the board. It does not mean that the broker has them, and it says nothing about a subscriber. Published does not mean received. For a reading that is sent again every 10 seconds, one lost message does little harm, and QoS 0 keeps the code small.
 
 ## BME280 Sensor Reading
 
 <InArticleAd />
 
+The BME280 from Bosch measures temperature, humidity and pressure. It answers on I2C at address 0x76 (or 0x77 if its SDO pin is tied high). The chip does not give finished values. It gives raw counts, and each chip carries its own correction constants from the factory. So the driver has two parts:
 
-The BME280 is a combined temperature, humidity, and pressure sensor from Bosch. It communicates over I2C at address 0x76 (or 0x77 if the SDO pin is pulled high). Reading the sensor involves writing calibration data from the chip's internal registers, triggering a measurement, reading the raw ADC values, and applying the compensation formulas from the datasheet.
+- `bme280_init` checks the chip ID, reads the correction constants (the calibration data) once, and starts the measurements.
+- `bme280_read` reads the raw counts and applies the formulas of the datasheet with those constants.
 
 ### BME280 I2C Communication
 
 ```rust title="BME280 driver (simplified, included in main.rs)"
 use embassy_rp::i2c::{Async, I2c, Config as I2cConfig, InterruptHandler as I2cIrq};
 use embassy_rp::peripherals::I2C0;
+use embedded_hal_async::i2c::I2c as _; // async write() and write_read()
 
 bind_interrupts!(struct I2cIrqs {
     I2C0_IRQ => I2cIrq<I2C0>;
@@ -685,14 +706,15 @@ async fn bme280_init(i2c: &mut I2c<'_, I2C0, Async>) -> Result<Bme280Calibration
         dig_h6: cal_h[6] as i8,
     };
 
-    // Configure: humidity oversampling x1
+    // Configure: standby 1000ms, filter off. Write this while the sensor is
+    // still in sleep mode; in normal mode a write to 0xF5 can be ignored.
+    i2c.write(BME280_ADDR, &[0xF5, 0xA0]).await.map_err(|_| ())?;
+
+    // Configure: humidity oversampling x1 (takes effect on the 0xF4 write)
     i2c.write(BME280_ADDR, &[0xF2, 0x01]).await.map_err(|_| ())?;
 
     // Configure: temp oversampling x1, pressure oversampling x1, normal mode
     i2c.write(BME280_ADDR, &[0xF4, 0x27]).await.map_err(|_| ())?;
-
-    // Configure: standby 1000ms, filter off
-    i2c.write(BME280_ADDR, &[0xF5, 0xA0]).await.map_err(|_| ())?;
 
     Ok(cal)
 }
@@ -733,7 +755,7 @@ async fn bme280_read(
         p = (((p << 31) - var2_p) * 3125) / var1_p;
         let var1_p = ((cal.dig_p9 as i64) * (p >> 13) * (p >> 13)) >> 25;
         let var2_p = ((cal.dig_p8 as i64) * p) >> 19;
-        ((p + var1_p + var2_p) >> 8) as u32 + (((cal.dig_p7 as i64) << 4) as u32)
+        (((p + var1_p + var2_p) >> 8) + ((cal.dig_p7 as i64) << 4)) as u32
     };
 
     // Humidity compensation
@@ -755,14 +777,13 @@ async fn bme280_read(
 }
 ```
 
-The compensation formulas come directly from the BME280 datasheet (section 4.2.3). They are integer-only arithmetic (no floating point), which is efficient on the Cortex-M0+ core. The temperature result is in centidegrees (2345 means 23.45 degrees C), humidity is in centi-percent, and pressure is in Pascals.
+The formulas come from the BME280 datasheet (section 4.2.3). They use whole numbers only, because the Cortex-M0+ has no hardware for fractions and whole-number arithmetic is fast on it. So the results are scaled: 2345 means 23.45 °C, 5678 means 56.78% humidity, and the pressure is in pascals.
 
 ## Complete MQTT Sensor Node
 
 <InArticleAd />
 
-
-Now we combine everything into the final project: Wi-Fi connection, BME280 reading, JSON formatting, MQTT publishing, and reconnection logic.
+The final project joins the parts.
 
 ### Circuit Connections
 
@@ -776,7 +797,7 @@ Now we combine everything into the final project: Wi-Fi connection, BME280 readi
 
 ### JSON Formatting (no_std)
 
-Since we are in a `no_std` environment, we format JSON manually:
+JSON is text, and `no_std` has no heap and no `format!` that returns a `String`. So the code writes the characters into a fixed buffer, one piece after another, and returns how many bytes it used:
 
 ```rust
 fn format_json(
@@ -882,7 +903,11 @@ use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config as NetConfig, StackResources};
 use embassy_time::{Duration, Timer};
 
-use cyw43_pio::PioSpi;
+use cyw43::JoinOptions;
+use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
+use embedded_hal_async::i2c::I2c as _; // async write() and write_read()
+use embedded_io_async::{Read, Write}; // read_exact() and write_all()
+use rand_core::RngCore;
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
@@ -944,8 +969,8 @@ async fn main(spawner: Spawner) {
 
     // ── CYW43 Initialization ───────────────────────────────────────
 
-    let fw = cyw43_firmware::firmware();
-    let clm = cyw43_firmware::clm();
+    let fw = cyw43_firmware::CYW43_43439A0;
+    let clm = cyw43_firmware::CYW43_43439A0_CLM;
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -954,6 +979,7 @@ async fn main(spawner: Spawner) {
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
+        DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
@@ -968,7 +994,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(cyw43_task(runner)).unwrap();
 
     control.init(clm).await;
-    control.set_power_management(cyw43::PowerManagement::PowerSave).await;
+    control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
 
     // ── Network Stack ──────────────────────────────────────────────
 
@@ -977,8 +1003,11 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
+    // Random seed for the stack (TCP sequence numbers, local ports)
+    let seed = embassy_rp::clocks::RoscRng.next_u64();
+
     let (stack, net_runner) = embassy_net::new(
-        net_device, net_config, resources, embassy_rp::clocks::RoscRng,
+        net_device, net_config, resources, seed,
     );
     spawner.spawn(net_task(net_runner)).unwrap();
 
@@ -986,7 +1015,7 @@ async fn main(spawner: Spawner) {
 
     info!("Connecting to Wi-Fi: {}", WIFI_SSID);
     loop {
-        match control.join_wpa2(WIFI_SSID, WIFI_PASS).await {
+        match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASS.as_bytes())).await {
             Ok(_) => {
                 info!("Wi-Fi connected");
                 break;
@@ -1092,7 +1121,7 @@ async fn main(spawner: Spawner) {
                     );
 
                     info!(
-                        "Temp: {}.{} C, Hum: {}.{} %, Press: {} Pa",
+                        "Temp: {}.{:02} C, Hum: {}.{:02} %, Press: {} Pa",
                         reading.temperature_c / 100,
                         (reading.temperature_c % 100).unsigned_abs(),
                         reading.humidity_pct / 100,
@@ -1143,7 +1172,7 @@ struct MqttClient<'a> {
     buf: [u8; 512],
 }
 
-#[derive(Debug)]
+#[derive(Debug, defmt::Format)]
 enum MqttError {
     WriteError,
     ReadError,
@@ -1283,9 +1312,9 @@ async fn bme280_init(i2c: &mut I2c<'_, I2C0, Async>) -> Result<Bme280Calibration
         dig_h6: cal_h[6] as i8,
     };
 
+    i2c.write(BME280_ADDR, &[0xF5, 0xA0]).await.map_err(|_| ())?; // config first (sleep mode)
     i2c.write(BME280_ADDR, &[0xF2, 0x01]).await.map_err(|_| ())?;
-    i2c.write(BME280_ADDR, &[0xF4, 0x27]).await.map_err(|_| ())?;
-    i2c.write(BME280_ADDR, &[0xF5, 0xA0]).await.map_err(|_| ())?;
+    i2c.write(BME280_ADDR, &[0xF4, 0x27]).await.map_err(|_| ())?; // starts normal mode
 
     Ok(cal)
 }
@@ -1323,7 +1352,7 @@ async fn bme280_read(
         p = (((p << 31) - var2_p) * 3125) / var1_p;
         let v1 = ((cal.dig_p9 as i64) * (p >> 13) * (p >> 13)) >> 25;
         let v2 = ((cal.dig_p8 as i64) * p) >> 19;
-        ((p + v1 + v2) >> 8) as u32 + (((cal.dig_p7 as i64) << 4) as u32)
+        (((p + v1 + v2) >> 8) + ((cal.dig_p7 as i64) << 4)) as u32
     };
 
     let mut v_x1 = t_fine - 76800i32;
@@ -1393,18 +1422,22 @@ fn write_u32_str(buf: &mut [u8], val: u32) -> usize {
 
 ### Reconnection Strategy
 
-The outer loop in `main` implements exponential backoff for reconnection. When a TCP connect or MQTT connect fails, the firmware waits `backoff_secs` before retrying, doubling the delay each time up to a maximum of 30 seconds. On a successful connection, the backoff resets to 1 second.
+A hundred boards that all try again at once, for ever, keep a broker down that is already in trouble. So the outer loop of `main` waits longer after each failure. This is exponential backoff: the wait starts at 1 second and doubles after each failed attempt (1, 2, 4, 8, 16) up to a limit of 30 seconds. A connection that succeeds sets it back to 1 second.
 
-The inner publish loop runs until a publish or ping operation fails, which indicates the TCP connection has dropped. The firmware then falls through to the outer loop, which handles reconnection. This pattern is robust against network interruptions: if the Wi-Fi drops temporarily, the MQTT publish will fail, and the firmware will reconnect automatically when the network is available again.
+The inner loop publishes until a publish or a ping returns an error. Then the outer loop makes a new socket and connects again.
 
-The status LED provides visual feedback: rapid blinking means a sensor error, three blinks at startup means Wi-Fi connected, solid on means MQTT connected and publishing, and off means disconnected and retrying.
+Two limits of this code are worth knowing:
+
+- A broken link is not seen at once. `publish` returns an error only after the TCP stack has given up, which takes 10 seconds (the socket timeout) or more. A reading handed over in that time is lost, although `publish` returned `Ok`.
+- The loop opens the TCP and MQTT connection again. It does not call `control.join()` again. It relies on the radio chip to find the same access point again by itself. If your board stays off the network after the router restarts, add a new join to the outer loop.
+
+The status LED tells you where the board is. Three blinks at startup: the board has an address. Fast blinking: the sensor did not answer. On: an MQTT session is open. Off: no session, waiting to try again.
 
 ## C vs Rust: Networking
 
 <InArticleAd />
 
-
-In C, network programming on embedded devices typically uses lwIP (Lightweight IP), which relies heavily on callbacks. Here is a simplified comparison of making a TCP connection and sending data:
+In C, a microcontroller usually runs the lwIP stack, which works with callbacks: you give it a function, and it calls that function later, when something has happened. Compare how each language opens a TCP connection and sends data:
 
 ```c title="C with lwIP (callback-based)"
 static err_t tcp_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
@@ -1452,14 +1485,13 @@ async fn start_connection(stack: Stack<'_>) -> Result<(), Error> {
 }
 ```
 
-The C version splits the connection flow across three callback functions. The control flow is implicit: each callback must set up the next step. Error handling requires maintaining a state machine with global or context-pointer state. Retry logic becomes a complex web of callbacks, timers, and state variables.
+The C version spreads one connection over three functions, and each callback must arrange the next step. To handle an error or to try again, you keep the progress in global variables and write the state machine by hand.
 
-The Rust version reads top-to-bottom like sequential code. Each `.await` suspends the task until the operation completes, then resumes exactly where it left off. Error handling uses the standard `?` operator. Retry logic is a simple `loop` with `continue`. The async executor handles the cooperative scheduling that makes this possible without threads or an RTOS.
+The Rust version reads from top to bottom. Each `.await` stops the task until the operation is finished and continues at the same line, so the compiler writes the state machine. An error leaves the function through `?`, and trying again is a `loop` with `continue`.
 
 ## Building and Flashing
 
 <InArticleAd />
-
 
 <Steps>
 1. Build the firmware:
@@ -1485,10 +1517,9 @@ The Rust version reads top-to-bottom like sequential code. Each `.await` suspend
 
 <InArticleAd />
 
-
 ### Setting Up a Mosquitto Broker
 
-You need an MQTT broker to receive the sensor data. Mosquitto is the most common open-source broker:
+You need a broker on your own network. Mosquitto is a common open-source broker. Since version 2.0 it accepts connections only from its own machine until you add a `listener 1883` line and an access rule to its configuration, which is one cause of "TCP connect failed" on the board.
 
 <Tabs>
 <TabItem label="Linux">
@@ -1553,19 +1584,19 @@ mosquitto_sub -h localhost -t "sensors/pico-w/bme280" -v
 
 <InArticleAd />
 
+**What stays on the board:** This node only reports. If you extend it to switch a heater, a fan or an alarm, the limit that switches it must be decided on the board. Wi-Fi fails and brokers restart, so a command from the network can arrive late or never. The broker and what sits behind it are for oversight, alerts and records.
 
-**Wi-Fi power management:** The CYW43 supports several power management modes. `PowerSave` reduces idle current but adds latency to incoming packets. For a publish-only sensor node, this is a good trade-off. If the device needs to respond to incoming MQTT messages quickly, use `PowerManagement::None` for lower latency at the cost of higher power consumption (~300 mA peak during TX).
+**Wi-Fi power management:** `PowerSave` lowers the idle current but delays incoming packets, which suits a node that only publishes. If the device must answer incoming MQTT messages quickly, use `PowerManagementMode::None`.
 
-**Connection stability:** Wi-Fi connections can drop for many reasons: router reboots, signal interference, DHCP lease expiration. The reconnection loop with exponential backoff handles all of these gracefully. For long-running deployments, consider adding a watchdog timer that resets the device if no successful publish occurs within a configurable timeout.
+**Connection stability:** A Wi-Fi connection drops when the router restarts, another signal interferes, or the DHCP lease ends. For a device that runs for months, add a watchdog timer that resets the board if no publish has succeeded for a set time.
 
-**TLS/SSL:** The example uses unencrypted TCP for MQTT. In production, you should use MQTT over TLS (port 8883). Embassy-net supports TLS through the `embedded-tls` crate, but it adds significant code size and memory usage. For devices on a trusted local network, unencrypted MQTT may be acceptable.
+**TLS:** The example sends MQTT as plain text, so anyone on the network can read it. Outside a trusted local network, use MQTT over TLS (port 8883). The `embedded-tls` crate adds TLS to `embassy-net`, at a cost in code size and RAM.
 
-**MQTT QoS levels:** This example uses QoS 0 (at most once delivery). For critical data, use QoS 1 (at least once) or QoS 2 (exactly once). QoS 1 requires handling PUBACK responses from the broker. QoS 2 requires a four-packet handshake per message. The added complexity is usually not worth it for periodic sensor readings.
+**MQTT QoS levels:** QoS 0 delivers a message at most once. With QoS 1 the broker answers each message with a PUBACK and the client sends again until the answer comes, so a message arrives at least once. QoS 2 uses four packets per message to deliver exactly once. For a reading that repeats every 10 seconds, the extra code is seldom worth it.
 
 ## Experiments
 
 <InArticleAd />
-
 
 <CardGrid>
 <Card title="Experiment 1: MQTT Subscriber" icon="pencil">
@@ -1585,12 +1616,9 @@ Add NTP (Network Time Protocol) support to timestamp each sensor reading. NTP us
 
 <InArticleAd />
 
-
-You connected the Pico W to Wi-Fi using the cyw43 driver and embassy-net, giving the RP2040 full TCP/IP networking without an operating system. The cyw43 driver communicates with the CYW43439 wireless chip over PIO-based SPI, and embassy-net provides async TCP sockets, DHCP, and DNS on top of the smoltcp TCP/IP stack. You built a minimal MQTT 3.1.1 client that connects to a broker, publishes JSON sensor data from a BME280, and handles disconnection with exponential backoff reconnection. The entire network stack runs as async tasks on the Embassy executor, using cooperative multitasking instead of threads. Compared to C with lwIP's callback-based API, the Rust async/await model keeps the connection logic readable and sequential, with error handling through the standard `?` operator instead of scattered callback chains.
+The cyw43 driver runs the radio chip, `embassy-net` turns bytes into packets, and both are tasks that run while your code awaits. Three states are not the same: the access point accepted the board, the board has an address, and the broker has a session open. Your small MQTT client publishes BME280 readings as JSON at QoS 0, where a publish that returns `Ok` has left your code and nothing more. A loop with exponential backoff opens the connection again after a failure.
 
 <EmbeddedRustRp2040Comments />
-
-
 
 <InArticleAd />
 <TawkWidget />

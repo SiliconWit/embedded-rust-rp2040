@@ -21,16 +21,14 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
   contributors={frontmatter.contributors}
 />
 
-
-
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-In C, a GPIO pin is just a number. You pass it to `gpio_init()`, `gpio_set_dir()`, and `gpio_put()`, and the compiler has no idea whether the pin is configured, what direction it is set to, or whether another part of your code is also modifying it. Bugs from misconfigured pins, double initialization, and unsynchronized access to shared peripherals are common and hard to trace. Rust solves all of these at compile time through ownership, borrowing, and the typestate pattern. In this lesson, you will see exactly how these mechanisms work by building a debounced button that toggles an LED, with proper error handling and safe interrupt-shared state. #Rust #Ownership #EmbeddedSystems
+A status LED works on the bench and is dark in the product, because a second module, written by someone else, set the same pin as an input. In C a pin is only a number: any code can configure it, and the compiler knows nothing about its state, so such faults are found late and by hand. Rust gives the compiler three tools to find them before the program is loaded: ownership (one part of the program holds a pin), borrowing (lending it for a moment), and the typestate pattern (the state of the pin is written in its type). In this lesson you build a debounced button that switches an LED, and you see each tool at work. #Rust #Ownership #EmbeddedSystems
 
 ## What We Are Building
 
 <Card title="Button-Toggled LED with Software Debounce" icon="star">
-A push button on GP14 toggles an external LED on GP15. Each press flips the LED state, with a 50 ms software debounce to ignore contact bounce. The program uses polling (not interrupts, which come in Lesson 3) and demonstrates ownership transfer, borrowing, Result-based error handling, and the typestate GPIO pattern. A second button on GP16 controls a second LED on GP17, demonstrating how to pass peripheral references between functions.
+A push button on GP14 switches an LED on GP15, and a second button on GP16 switches a second LED on GP17. A mechanical button makes several quick contacts when pressed (bounce), so the program waits until the reading has been steady for 50 ms (debouncing). The program reads the buttons in a loop, with no interrupts.
 </Card>
 
 **Project specifications:**
@@ -49,12 +47,12 @@ A push button on GP14 toggles an external LED on GP15. Each press flips the LED 
 
 | Component | Quantity | Notes |
 |-----------|----------|-------|
-| Raspberry Pi Pico | 1 | From Lesson 1 |
-| Debug probe | 1 | From Lesson 1 |
+| Raspberry Pi Pico | 1 | As for the first blink |
+| Debug probe | 1 | |
 | Push buttons | 2 | Tactile momentary switches |
 | LEDs (any color) | 2 | 3mm or 5mm |
 | 220 ohm resistors | 2 | Current limiting for LEDs |
-| Breadboard + jumper wires | 1 set | From Lesson 1 |
+| Breadboard + jumper wires | 1 set | |
 
 ### Wiring Table
 
@@ -70,10 +68,11 @@ A push button on GP14 toggles an external LED on GP15. Each press flips the LED 
 
 <InArticleAd />
 
+A peripheral should be used by one part of the program at a time. If two parts both send on the UART, their bytes mix. In C you prevent this with discipline and documentation. In Rust the compiler prevents it, with a rule called ownership.
 
-Ownership is Rust's central concept. Every value has exactly one owner. When the owner goes out of scope, the value is dropped (cleaned up). When you assign a value to a new variable or pass it to a function, ownership moves (the original variable becomes unusable). This is not garbage collection; it is a compile-time analysis with zero runtime cost.
+Think of a room with one key. Every value in Rust (a pin, a UART, a buffer) is such a room, and exactly one variable holds its key: the owner. When you assign the value to another variable or pass it to a function, the key goes with it. This is a move, and the old variable cannot be used again. When the owner reaches the end of its scope (the closing brace of its block), the value is dropped: Rust cleans it up.
 
-For embedded systems, ownership maps perfectly to hardware: a peripheral should have exactly one owner. If two parts of your code both "own" the UART, they might send data simultaneously and corrupt each other's output. If two functions both configure the same GPIO pin, one might overwrite the other's settings. In C, preventing this requires discipline and documentation. In Rust, the compiler enforces it.
+The compiler checks this while it builds the program, so ownership costs no speed and no memory at run time.
 
 ### Move Semantics
 
@@ -91,14 +90,14 @@ let led = pins.gpio15.into_push_pull_output();
 
 // This would not compile:
 // let another_led = pins.gpio15.into_push_pull_output();
-//                   ^^^^^^^^^^^ value used after move
+//                   ^^^^^^^^^^^ value used here after move
 ```
 
-The `.into_push_pull_output()` method consumes `pins.gpio15` by taking ownership of it. The original `pins.gpio15` field is now empty. If you try to use it again, the compiler rejects the code with a "value used after move" error. In C, nothing prevents you from calling `gpio_init(15)` twice.
+The method `.into_push_pull_output()` takes ownership of `pins.gpio15` and gives back the output pin `led`. If you use `pins.gpio15` again, the compiler stops with the error "use of moved value" (E0382) and points to both lines: where the value moved, and where you used it after that. The compiler is refusing a second user for one pin. That is good news: it has found, at your desk, the fault that in C appears as a dark LED in the product.
 
 ### Why This Matters for Hardware
 
-Consider this C bug:
+This is the fault from the start of the lesson, written in C:
 
 ```c
 // Module A: configures GP15 as a status LED output
@@ -113,12 +112,13 @@ gpio_set_dir(15, GPIO_IN);
 gpio_put(15, 1);  // does nothing, no error, no warning
 ```
 
-In Rust, this is structurally impossible. Module A takes ownership of the pin. Module B cannot access it.
+In Rust this program cannot be written. Module A owns the pin, so module B has no value to configure.
 
 ## Typestate GPIO
 
 <InArticleAd />
 
+Ownership settles who may use a pin. A second C fault remains: a pin used in the wrong state, such as a write to a pin that is still an input. The typestate pattern puts the state of the pin into its type. An unconfigured pin, an output pin and an input pin are three types, each with only the functions that make sense for it. Each arrow in the diagram is a function that takes the pin in one type and returns it in another.
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
@@ -133,9 +133,9 @@ flowchart TD
     Input -->|"into_floating_disabled()"| Unconfigured
 ```
 
-The typestate pattern encodes the state of a resource in its type. The rp2040-hal uses this extensively for GPIO pins. A pin that has not been configured has a different type than a pin configured as an output, and both have different types from a pin configured as an input. The compiler uses these types to determine which operations are valid.
-
 ### Pin State Types
+
+Read the angle brackets of a pin type as a list of facts: which pin it is, what function it has, and which pull resistor is on. A type with such parameters is a generic type. SIO is the RP2040 block for plain input and output.
 
 ```rust
 use rp2040_hal::gpio::{
@@ -174,11 +174,11 @@ raw_pin.set_high();  // COMPILE ERROR: set_high() not defined
                       // for FunctionNull pins
 ```
 
-Every one of these mistakes compiles and runs in C (usually doing nothing visible, or worse, doing something subtly wrong). In Rust, every one is caught before the code reaches the chip.
+In each case the compiler reports that the function does not exist for this type of pin. It is refusing an operation that the hardware, in its present state, cannot do. In C all three compile, and the pin does nothing or does the wrong thing.
 
 ### Reconfiguring Pins
 
-Sometimes you need to change a pin's configuration at runtime (for example, switching between input and output for a bidirectional bus). Rust handles this through type state transitions:
+Some pins must change at run time, for example a data line that is an output and then an input. The pin moves from one type to the next:
 
 ```rust
 // Start as output
@@ -186,7 +186,7 @@ let mut led = pins.gpio15.into_push_pull_output();
 led.set_high().unwrap();
 
 // Reconfigure as input (consumes the output pin, returns an input pin)
-let sensor = led.into_pull_up_input();
+let mut sensor = led.into_pull_up_input();
 let value = sensor.is_high().unwrap();
 
 // Reconfigure back to output
@@ -194,20 +194,31 @@ let mut led = sensor.into_push_pull_output();
 led.set_low().unwrap();
 ```
 
-Each transition consumes the old type and returns a new one. You cannot accidentally hold references to both the input and output versions of the same pin.
+Each step takes the old value and returns a new one, so the input form and the output form of one pin never exist together.
 
 ## Button Debouncing with Ownership
 
 <InArticleAd />
 
+The contacts of a mechanical button bounce for 1 to 20 ms when you press it. Without debouncing, the program counts one press as 5 or 10.
 
-Mechanical push buttons do not produce clean transitions. When you press a button, the contacts bounce several times over 1 to 20 ms, generating multiple rapid edges. Without debouncing, a single press might register as 5 or 10 presses. The debounce logic owns its state (last stable reading, timestamp of last change) and borrows the button pin to read it.
+```text
+  pin
+  high ───┐ ┌┐ ┌┐           ┌─────
+          │ ││ ││           │
+  low     └─┘└─┘└───────────┘
+          │bounce│  steady  │
+           1 to 20 ms
+  raw reading:    several falling edges
+  after debounce: one press
+```
+
+The debouncer below owns its state (the last steady reading and the time of the last change). It does not own the button pin: the caller lends it the pin for each reading. Lending is called borrowing and is written `&mut`.
 
 ### Debouncer Struct
 
 ```rust
 use embedded_hal::digital::InputPin;
-use rp2040_hal::fugit::MicrosDurationU64;
 
 /// Software debouncer that owns its internal state.
 /// The button pin is borrowed (not owned) so the caller
@@ -223,8 +234,8 @@ impl Debouncer {
     /// Create a new debouncer with the given debounce period.
     pub fn new(debounce_us: u64) -> Self {
         Debouncer {
-            last_raw: false,
-            stable: false,
+            last_raw: true,    // pull-up: released = high = true
+            stable: true,
             last_change_us: 0,
             debounce_us,
         }
@@ -259,18 +270,18 @@ impl Debouncer {
 }
 ```
 
-Notice the ownership patterns:
+How to read this code if you come from C:
 
-- `Debouncer` **owns** its internal state (`last_raw`, `stable`, timestamps). Nobody else can modify these.
-- The `update()` method **borrows** the pin (`&P`) rather than owning it. This means the caller keeps ownership of the pin and can use it elsewhere if needed.
-- The generic `P: InputPin` means this debouncer works with any pin type that implements `InputPin`, not just RP2040 pins.
+- `struct Debouncer` holds the data, and the `impl Debouncer` block holds its functions. `Debouncer` owns its fields, so no other code can change them.
+- `&mut self` is the struct itself, lent to the function with permission to change it. `&self` lends it for reading only.
+- `update()` borrows the pin (`pin: &mut P`), so the caller keeps the pin.
+- `<P: InputPin>` makes the function generic: `P` is any type that has the functions of the `InputPin` trait, so the debouncer works with any input pin on any chip. The compiler builds one copy of `update()` for each pin type you use, with no cost at run time.
 
 ## Error Handling: Result vs C Error Codes
 
 <InArticleAd />
 
-
-In C embedded code, error handling is inconsistent. Some functions return error codes, some set global error flags, some return sentinel values, and some simply ignore errors. The compiler does not enforce checking any of these.
+In C, a function reports an error through a return code, a global flag or a special value, and nothing makes the caller look at it:
 
 ```c
 // C: errors are easily ignored
@@ -280,7 +291,7 @@ int status = i2c_read(I2C0, addr, buf, len);
 gpio_put(15, 1);  // What if pin 15 is not initialized? No indication.
 ```
 
-In Rust, operations that can fail return `Result<T, E>`. You must handle the Result before you can access the value inside. The compiler will warn (and can be configured to error) if you ignore a Result.
+In Rust, a function that can fail returns `Result<T, E>`. It holds either `Ok(value)`, where the value has type `T`, or `Err(error)`, where the error has type `E`. The value is inside the `Result`, so you cannot reach it without deciding what to do about the error. If you ignore a `Result`, the compiler warns you. The usual tool is `match`, a `switch` that must cover every case:
 
 ```rust
 // Rust: the compiler tracks error handling
@@ -293,7 +304,7 @@ match led.set_high() {
 led.set_high().unwrap();  // panics if it somehow fails (documents your assumption)
 
 // Or, to propagate errors up:
-fn toggle_led(led: &mut impl OutputPin) -> Result<(), impl core::fmt::Debug> {
+fn toggle_led<P: OutputPin>(led: &mut P) -> Result<(), P::Error> {
     led.set_high()?;  // the ? operator returns early on error
     Ok(())
 }
@@ -301,7 +312,7 @@ fn toggle_led(led: &mut impl OutputPin) -> Result<(), impl core::fmt::Debug> {
 
 ### The `?` Operator
 
-The `?` operator is Rust's way of propagating errors. If the expression before `?` is `Err(e)`, the function returns early with that error. If it is `Ok(v)`, the value `v` is extracted. This replaces the C pattern of checking every return value:
+The `?` operator passes an error up to the caller. If the expression before `?` is `Err(e)`, the function returns at once with that error. If it is `Ok(v)`, you get the value `v`. It replaces the C habit of testing every return value:
 
 ```c
 // C: tedious error checking
@@ -316,8 +327,8 @@ if (status != 0) return status;
 
 ```rust
 // Rust: clean error propagation
-fn spi_transfer(spi: &mut impl SpiDevice, data: &[u8], buf: &mut [u8])
-    -> Result<(), SpiError>
+fn spi_transfer<S: SpiDevice>(spi: &mut S, data: &[u8], buf: &mut [u8])
+    -> Result<(), S::Error>
 {
     spi.write(data)?;
     spi.read(buf)?;
@@ -329,32 +340,35 @@ fn spi_transfer(spi: &mut impl SpiDevice, data: &[u8], buf: &mut [u8])
 
 <InArticleAd />
 
+If every call moved the key, you could use a pin only once. So the owner can lend a value: the function gets a reference (a borrow), and the owner still has the value when the function returns. A reference is a pointer that the compiler has checked. It is never NULL, and it cannot outlive the value it points to. The span in which a reference is valid is its lifetime. In C you can return a pointer to a local variable, and it then points to stack memory that is gone. Rust does not compile that function.
 
-Functions often need access to peripherals they do not own. Rust handles this through references (borrowing). You can lend a peripheral to a function without giving up ownership.
+One rule covers the two kinds of reference: at any moment a value has either any number of readers or exactly one writer.
 
 ### Immutable References (`&T`)
 
-Multiple parts of the code can read a peripheral simultaneously through immutable references:
+Several parts of the code can read a value at the same time through immutable (read-only) references:
 
 ```rust
-fn print_button_state(button: &impl InputPin) {
-    if button.is_high().unwrap() {
-        defmt::info!("Button released");
-    } else {
+fn print_button_state(debouncer: &Debouncer) {
+    if debouncer.is_pressed() {
         defmt::info!("Button pressed");
+    } else {
+        defmt::info!("Button released");
     }
 }
 
 // Multiple reads are fine
-let button = pins.gpio14.into_pull_up_input();
-print_button_state(&button);  // borrows button
-print_button_state(&button);  // borrows again, no problem
-// button is still owned here
+let debouncer = Debouncer::new(50_000);
+print_button_state(&debouncer);  // borrows debouncer
+print_button_state(&debouncer);  // borrows again, no problem
+// debouncer is still owned here
 ```
+
+Reading a pin is different. In embedded-hal 1.0, `InputPin::is_high()` takes `&mut self`. With `&impl InputPin` the compiler stops with E0596, "cannot borrow as mutable": you asked for write access through a read-only loan. This is why `Debouncer::update()` takes `&mut P`.
 
 ### Mutable References (`&mut T`)
 
-Only one mutable reference can exist at a time. This prevents data races at compile time:
+Only one mutable reference to a value can exist at a time, and no reader beside it:
 
 ```rust
 fn toggle_led(led: &mut impl OutputPin, on: bool) {
@@ -370,14 +384,13 @@ toggle_led(&mut led, true);   // exclusive mutable borrow
 toggle_led(&mut led, false);  // exclusive mutable borrow (previous one ended)
 ```
 
-The compiler guarantees that while `toggle_led` has a `&mut` reference to the LED, no other code can access it. This eliminates an entire class of concurrency bugs.
+While `toggle_led` holds the `&mut` reference, no other code can touch the LED. Two pieces of code can therefore never change one value at the same time.
 
 ## Static Variables and the Mutex Pattern
 
 <InArticleAd />
 
-
-In C, sharing data between the main loop and an interrupt handler is simple (and dangerous):
+The main loop and an interrupt handler (ISR, interrupt service routine) often need the same variable. In C this is easy to write and easy to get wrong:
 
 ```c
 // C: global mutable state (common source of bugs)
@@ -400,11 +413,16 @@ int main(void) {
 }
 ```
 
-This has a data race: the interrupt can fire between checking `flag` and reading `counter`, giving an inconsistent view. The `volatile` keyword only prevents the compiler from optimizing away the read; it does not prevent torn reads or inconsistent state.
+The interrupt can fire between the test of `flag` and the read of `counter`, so the two values do not belong together. This is a data race. `volatile` only makes the compiler read the variable from memory each time. It does not keep the interrupt out.
 
-Rust makes global mutable state intentionally difficult. You cannot have a `static mut` variable without `unsafe`, and the compiler is right to warn you: mutable statics are inherently unsafe because any code can access them without synchronization.
+In Rust a global variable is a `static`, and one that can change is a `static mut`. Any code can reach a `static mut` at any moment, which breaks the rule of one writer, so the compiler accepts it only inside an `unsafe` block. `unsafe` marks code where the compiler cannot check the rules and you promise that you have checked them yourself. The safe way needs no such promise.
 
 ### The Safe Pattern: Mutex with Critical Section
+
+A critical section is a short piece of code that runs with interrupts off. Two wrappers around the data make the compiler insist on it:
+
+- `Mutex` opens only for code that shows a token, `cs`. The only source of the token is `critical_section::with(...)`, which turns interrupts off, runs your code, and turns them on again. Your code goes between `|cs| {` and `}`: a closure, which is a function written in place.
+- `RefCell` lets you change a value that is declared without `mut`, and checks the rule of one writer at run time.
 
 ```rust
 use core::cell::RefCell;
@@ -441,7 +459,7 @@ fn check_counter() {
 }
 ```
 
-The `critical_section::with()` function disables interrupts, executes the closure, and re-enables interrupts. The `CriticalSection` token (`cs`) passed to the closure is proof that interrupts are disabled, and the `Mutex` requires this token to grant access. This means you cannot access the shared data without first disabling interrupts, which eliminates the data race by construction.
+The token `cs` is the proof that interrupts are off. Without it the `Mutex` gives nothing, so code that reads the shared data with interrupts on does not compile. The data race of the C version cannot be written.
 
 <Tabs>
 <TabItem label="C: volatile global">
@@ -482,7 +500,6 @@ critical_section::with(|cs| {
 ## Complete Project: Button-Toggled LED
 
 <InArticleAd />
-
 
 ### Project Structure
 
@@ -526,7 +543,7 @@ opt-level = "s"
 overflow-checks = false
 ```
 
-Use the same `memory.x`, `build.rs`, `.cargo/config.toml`, and `Embed.toml` from Lesson 1.
+Use the same `memory.x`, `build.rs`, `.cargo/config.toml`, and `Embed.toml` as in [the first blink project](/education/embedded-rust-rp2040/rust-toolchain-first-blink/).
 
 ### src/main.rs
 
@@ -550,7 +567,6 @@ use defmt_rtt as _;
 use rp_pico::entry;
 use rp_pico::hal;
 use rp_pico::hal::pac;
-use rp_pico::hal::Clock;
 
 use embedded_hal::digital::{InputPin, OutputPin};
 
@@ -679,7 +695,7 @@ fn main() -> ! {
     loop {
         let now = timer.get_counter().ticks();
 
-        // Check button 1 (borrows button1 immutably, debounce1 mutably)
+        // Check button 1 (borrows button1 and debounce1 mutably)
         if debounce1.update(&mut button1, now) {
             // Toggle LED 1 (borrows led1 mutably)
             toggle_led(&mut led1, &mut led1_on);
@@ -691,7 +707,7 @@ fn main() -> ! {
             report_state("LED 1", &led1_on);
         }
 
-        // Check button 2 (borrows button2 immutably, debounce2 mutably)
+        // Check button 2 (borrows button2 and debounce2 mutably)
         if debounce2.update(&mut button2, now) {
             // Toggle LED 2 (borrows led2 mutably)
             toggle_led(&mut led2, &mut led2_on);
@@ -728,102 +744,78 @@ INFO  LED 2: ON
 ### Testing Checklist
 
 <Steps>
-1. Press Button 1 once. LED 1 should turn on. Press again. LED 1 should turn off.
+1. Press Button 1. LED 1 turns on. Press again. LED 1 turns off.
 
-2. Press Button 2 once. LED 2 should turn on independently of LED 1.
+2. Press Button 2. LED 2 changes and LED 1 does not.
 
-3. Press both buttons rapidly. Each LED should toggle independently. The debounce should prevent double-counting.
+3. Press both buttons quickly, many times. Each press counts once.
 
-4. Hold a button down. Only one toggle should register (on the initial press, not while held).
+4. Hold a button down. The LED changes once, at the start of the press.
 
-5. Check the RTT output. Each press should show exactly one "Button N pressed" message with an incrementing total count.
+5. Read the log. Each press gives exactly one "Button N pressed" line, and the total rises by one.
 </Steps>
 
 ## Ownership Patterns Summary
 
 <InArticleAd />
 
-
-| Pattern | When to Use | Example in This Lesson |
-|---------|-------------|----------------------|
-| **Move (ownership transfer)** | When a function needs permanent control of a resource | `pins.gpio15.into_push_pull_output()` consumes the pin |
-| **Immutable borrow (`&T`)** | When a function needs to read but not modify | `debounce.update(&button, now)` reads the button |
-| **Mutable borrow (`&mut T`)** | When a function needs to modify | `toggle_led(&mut led, &mut state)` sets the LED |
-| **Owned state in struct** | When state must be encapsulated | `Debouncer` owns its timing variables |
-| **Generics with traits** | When code should work with any compatible type | `fn toggle_led<P: OutputPin>(led: &mut P, ...)` |
+Choose by what the function needs: a move when it keeps the value for good (`into_push_pull_output()`), `&T` when it only reads (`report_state`), and `&mut T` when it changes the value or calls a `&mut self` function such as `is_high()` (`toggle_led`).
 
 ### Rules the Compiler Enforces
 
-1. **One owner at a time.** A value can have exactly one owner. Moving transfers ownership.
-2. **Many immutable borrows OR one mutable borrow.** Never both simultaneously.
-3. **Borrows must not outlive the owner.** The compiler tracks lifetimes.
-4. **No use after move.** Once a value is moved, the old name is invalid.
+1. A value has exactly one owner. A move passes ownership on, and the old name cannot be used again.
+2. A value has many readers (`&T`) or one writer (`&mut T`), never both at once.
+3. A borrow must not outlive the owner. The compiler follows the lifetimes.
 
-These rules, applied to hardware peripherals, eliminate:
-- Double initialization of the same peripheral
-- Reading a pin configured as output (or writing to an input)
-- Using an unconfigured peripheral
-- Two modules modifying the same peripheral without synchronization
-- Use-after-free of DMA buffers (covered in Lesson 5)
+Applied to peripherals, these rules remove:
+- A peripheral that is initialized twice, or used before it is configured
+- Two modules that change one peripheral with no coordination
+- A DMA buffer that is used while the hardware still writes to it (shown later with UART and DMA)
 
 ## Production Notes
 
 <InArticleAd />
 
-
 <Card title="Production Considerations" icon="setting">
 
-**Typestate overhead:** The typestate pattern is entirely a compile-time construct. At runtime, `pin.into_push_pull_output()` generates the same register writes as the C equivalent. There is no extra RAM, flash, or CPU overhead. The safety is free.
+**Typestate overhead:** The pin types exist only in the compiler. At run time, `pin.into_push_pull_output()` does the same register writes as the C code.
 
-**Debounce timing:** The 50 ms debounce period works well for most tactile switches. For capacitive touch buttons or reed switches, you may need different values. The debouncer struct makes this easy to tune per-button.
+**Debounce timing:** 50 ms suits most tactile switches. Each `Debouncer` takes its own value.
 
-**Pulling pins low vs high:** The RP2040 has configurable internal pull-ups and pull-downs. Using `into_pull_up_input()` and wiring buttons to GND is the most common pattern because it reduces external components. Make sure your buttons connect between the pin and GND, not between the pin and 3.3V.
+**Pull-up wiring:** With `into_pull_up_input()`, the button sits between the pin and GND, not between the pin and 3.3V.
 
-**Critical section cost:** On the single-core RP2040, `critical_section::with()` disables interrupts globally. The critical section should be as short as possible to minimize interrupt latency. Copy data out of the Mutex inside the closure, then process it outside. On the dual-core RP2040, the critical section uses spinlocks, which are more expensive.
+**Critical section cost:** The RP2040 has two cores. With the `critical-section-impl` feature of `rp2040-hal`, `critical_section::with()` turns interrupts off on the current core and takes a hardware spinlock, so the other core is kept out as well. Interrupts wait while the closure runs, so copy the data out of the Mutex inside the closure and process it outside.
 
-**RefCell panics:** `RefCell` performs runtime borrow checking. If you borrow mutably while an immutable borrow is still active, it panics. In `no_std`, this triggers the panic handler. During development, use `panic-probe` to see the panic location over defmt.
+**RefCell panics:** If you borrow mutably from a `RefCell` while another borrow is still active, the program panics. `panic-probe` shows the place over defmt.
 </Card>
 
 ## What You Have Learned
 
 <InArticleAd />
 
-
 <Card title="Lesson 2 Complete" icon="approve-check">
 
-**Ownership concepts:**
-- Move semantics: `.into_*()` methods consume the original value
-- Peripheral singletons prevent double initialization
-- One owner at a time, enforced at compile time
-
-**Borrowing:**
-- Immutable references (`&T`) for reading peripherals
-- Mutable references (`&mut T`) for modifying peripherals
-- Generic functions with trait bounds for reusable code
+**Ownership and borrowing:**
+- One owner at a time; `.into_*()` functions move the pin
+- `&T` to read, `&mut T` to change, generic functions for any pin type
 
 **Typestate GPIO:**
-- Pin types encode configuration state (input, output, pull-up, pull-down)
-- Invalid operations (write to input, read from output) are compile errors
-- Type transitions with `.into_*()` methods
+- The type of a pin holds its configuration
+- A write to an input or a read from an output is a compile error
 
 **Error handling:**
-- `Result<T, E>` for fallible operations
-- `unwrap()`, pattern matching, and the `?` operator
-- Compiler enforcement of error checking
+- `Result<T, E>` with `match`, `unwrap()` and the `?` operator
 
 **Shared state:**
-- `Mutex<RefCell<T>>` for interrupt-safe global state
-- `critical_section::with()` for atomic access
-- Why `static mut` is unsafe and what to use instead
+- `Mutex<RefCell<T>>` with `critical_section::with()` for data shared with an interrupt
+- Why `static mut` needs `unsafe`, and what to use in its place
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 3: Timers, PWM, and Interrupts](/education/embedded-rust-rp2040/timers-pwm-interrupts), you will configure RP2040 timers, generate servo-grade PWM, handle interrupts with the critical-section crate, and read analog inputs. You will build a potentiometer-controlled servo with buzzer feedback, combining timers, PWM, ADC, and interrupts in one project.
+In [Timers, PWM, and Interrupts](/education/embedded-rust-rp2040/timers-pwm-interrupts/), you drive a servo with PWM, read a potentiometer with the ADC, and use the Mutex pattern in a real interrupt handler that plays a tone on a buzzer.
 :::
 
 <EmbeddedRustRp2040Comments />
-
-
 
 <InArticleAd />
 <TawkWidget />

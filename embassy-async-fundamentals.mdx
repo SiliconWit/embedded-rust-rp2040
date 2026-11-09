@@ -21,16 +21,14 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
   contributors={frontmatter.contributors}
 />
 
-
-
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-This is the lesson where embedded Rust stops looking like C with extra syntax and starts showing its true advantage. Embassy is an async runtime designed from the ground up for microcontrollers. It replaces a traditional RTOS by turning every `async fn` into a compiler-generated state machine that shares a single stack. No heap allocator, no per-task stack allocation, no priority inversion bugs. You write code that reads like sequential logic, yet the executor interleaves your tasks cooperatively whenever one of them awaits a timer, a peripheral, or a channel message. By the end of this lesson you will have three tasks running concurrently on a Raspberry Pi Pico: an LED blinker, a button monitor, and a serial reporter, all sharing the same 264 KB of RAM that a FreeRTOS equivalent would struggle to fit two tasks into. #Embassy #AsyncEmbedded #RP2040
+A device that blinks a light, watches a button and sends a report has three slow jobs, and each job is mostly waiting. In C you write one large loop, where one long delay makes the button feel dead, or you add an RTOS and give every task its own stack, whose size you must guess. Embassy is a third way. You write each job as a function that looks sequential, and at every place where the job must wait it gives the processor back, so another job can run. All jobs share one stack and there is no heap. In this lesson you build three such tasks on a Raspberry Pi Pico: an LED blinker, a button monitor and a reporter. #Embassy #AsyncEmbedded #RP2040
 
 ## What We Are Building
 
 <Card title="Multi-Task Async System" icon="star">
-Three concurrent Embassy tasks on a single Pico board. Task 1 blinks an external LED at a configurable rate. Task 2 monitors a push button with debounce logic and toggles the blink pattern. Task 3 reports system state (button press count, current pattern, uptime) over USB serial every 2 seconds. All tasks communicate through Embassy channels and signals, with zero heap allocation.
+Three Embassy tasks on one Pico board. Task 1 blinks an external LED in one of three patterns. Task 2 watches a push button, ignores contact bounce, and changes the blink pattern on a long press. Task 3 reports the press counts and the uptime at least every 2 seconds. The tasks pass data through an Embassy channel and a signal, with no heap.
 </Card>
 
 **Project specifications:**
@@ -42,7 +40,7 @@ Three concurrent Embassy tasks on a single Pico board. Task 1 blinks an external
 | Communication | Channel for button events, Signal for pattern change |
 | LED Output | GP15 (external LED through 220 ohm resistor) |
 | Button Input | GP14 (active-low with internal pull-up) |
-| Serial Output | USB CDC at 115200 baud |
+| Report Output | defmt log through the debug probe (a USB serial variant follows) |
 | Heap Allocation | None (no alloc crate) |
 
 ### Bill of Materials
@@ -69,60 +67,58 @@ Three concurrent Embassy tasks on a single Pico board. Task 1 blinks an external
 
 <InArticleAd />
 
+Most of what a microcontroller does is waiting: for a timer, for a button, for a byte from a sensor. The question is what the processor does during a wait, and what it costs in memory to have several waits open at once.
 
-Every traditional RTOS (FreeRTOS, Zephyr, RIOT) follows the same model: each task gets its own stack, a scheduler preempts tasks based on priority, and the kernel manages task control blocks on the heap. This model works, but it costs real RAM on small microcontrollers.
+An RTOS (real-time operating system, for example FreeRTOS or Zephyr) answers with one stack per task. A stack is the memory where a function keeps its local variables. The scheduler may stop a task between any two instructions and continue another (this is preemption), so each task needs a private stack that is large enough for its worst case. This works, but it costs RAM: 512 to 2048 bytes of stack for each task, and a kernel heap of 4 KB or more. Three FreeRTOS tasks take 8 to 10 KB.
 
-On an RP2040 with 264 KB of SRAM, a FreeRTOS configuration typically allocates:
+Embassy answers in another way. Five words carry the whole idea, and every program from here on uses them:
 
-| Resource | FreeRTOS | Embassy |
-|----------|----------|---------|
-| Per-task stack | 512 to 2048 bytes each | 0 (shared main stack) |
-| Task control block | ~92 bytes each | ~0 (compile-time state machine) |
-| Kernel heap | 4096+ bytes (configurable) | 0 (no heap) |
-| Timer structures | Heap-allocated linked list | Static, compile-time |
-| Total for 3 tasks | ~8 to 10 KB minimum | ~1.2 KB total |
+- An `async fn` is a function that may stop in the middle and continue later. Calling it does not run it. The call returns a future.
+- A future is a value that stands for work that is not finished yet: "500 ms have passed", "a byte has arrived".
+- `.await` says: "I cannot continue until this future is finished, so give the processor to someone else." It is the only place where a task lets go of the processor.
+- A task is an `async fn` that the program has started and that lives for the whole run.
+- The executor is the small loop that owns the processor. To poll a task is to run it until its next `.await`. The executor polls each task that is ready, and when no task is ready it puts the processor to sleep.
 
-Embassy achieves this by leveraging Rust's `async`/`await` at the language level. When you write an `async fn`, the Rust compiler transforms it into a state machine enum. Each state captures only the local variables that are live across an `.await` point, not the entire call stack. The executor polls these state machines on a single thread, using hardware interrupts from timer peripherals to wake tasks at the right moment.
+Think of one cook with three pots, who stirs a pot, sets a timer for it and moves to the next. The comparison stops at one point: a cook who sees a pot boil over can jump to it, but the executor cannot take the processor from a task. It must wait for that task's next `.await`.
+
+The memory saving comes from the compiler. It turns each `async fn` into a state machine: a small struct that remembers at which `.await` the task stopped, and only the local variables it still needs after that point. The size of that struct is known at build time, so no task needs a stack of its own.
+
+The drawing shows the three tasks of this lesson for two seconds. The button is pressed at 1100 ms and released at 1300 ms.
+
+```text
+ time (ms)  0         500       1000      1500      2000
+            |         |         |         |         |
+ blinker    █.........█.........█.........█.........█
+ button     █.....................█...█..............
+ reporter   █..........................█.............
+ processor  █zzzzzzzzz█zzzzzzzzz█z█zzz██zz█zzzzzzzzz█
+
+ █  a task runs for some microseconds, to its next .await
+ .  the task waits at an .await and uses no processor time
+ z  no task is ready, so the processor sleeps
+```
+
+Each task runs only for a moment and then waits. After the release the button task sends a message, and the reporter runs just after it, not at the same time: only one task runs at any moment.
 
 ### The Key Differences
 
 <CardGrid>
-  <Card title="No Preemption" icon="warning">
-    Embassy tasks cooperate. A task runs until it hits an `.await`, then yields. If a task never awaits, it starves all others. This is simpler to reason about (no data races from preemption), but you must structure code to await regularly.
+  <Card title="No preemption" icon="warning">
+    A task runs until it reaches an `.await`. If a task never awaits, no other task runs at all: the LED stops and the button is dead. In return, a task is never cut in the middle of an update, so the data races that preemption causes cannot happen.
   </Card>
-  <Card title="No Per-Task Stacks" icon="approve-check">
-    In FreeRTOS, you must guess each task's maximum stack depth and pad it for safety. Guess too low, you get stack overflow. Guess too high, you waste RAM. Embassy eliminates this entirely because the compiler calculates the exact state machine size at build time.
+  <Card title="No stacks to size, no heap" icon="approve-check">
+    In FreeRTOS you guess the deepest stack use of each task: too low overflows, too high wastes RAM. In Embassy the compiler calculates the size of each state machine, and nothing calls `malloc`, so the linker shows the whole memory use.
   </Card>
-  <Card title="Compile-Time Guarantees" icon="approve-check">
-    The Rust type system ensures you cannot forget to `.await` a future, cannot share mutable state between tasks without synchronization, and cannot access a peripheral from two tasks simultaneously. These are compile errors, not runtime bugs.
-  </Card>
-  <Card title="Zero Heap" icon="approve-check">
-    Embassy never calls `malloc`. All task state, channels, signals, and timer structures are statically allocated. This means no fragmentation, no out-of-memory panics at runtime, and deterministic memory usage visible at link time.
+  <Card title="Checked at compile time" icon="approve-check">
+    The compiler warns you when you forget to `.await` a future. It refuses a program in which two tasks change the same data without a lock, or use the same peripheral.
   </Card>
 </CardGrid>
-
-```mermaid
-%%{init: {'flowchart': {'curve': 'linear'}}}%%
-flowchart TD
-    EX(["Executor loop"]) --> A["Poll Task A"]
-    A -->|"hits .await"| B["Poll Task B"]
-    B -->|"hits .await"| C["Poll Task C"]
-    C -->|"hits .await"| WFI["WFI\n(sleep until interrupt)"]
-    WFI -->|"Timer/peripheral\ninterrupt fires"| EX
-
-    subgraph Single Stack
-        A
-        B
-        C
-    end
-```
 
 ## Setting Up an Embassy Project
 
 <InArticleAd />
 
-
-Before writing code, you need the correct project structure and dependencies. Embassy is a collection of crates, each handling a specific concern.
+Embassy is a set of crates (Rust libraries), each for one concern. The project needs these files.
 
 ### Project Structure
 
@@ -140,7 +136,7 @@ Before writing code, you need the correct project structure and dependencies. Em
 
 ### Cargo.toml
 
-The dependency list is longer than a bare-metal project because Embassy splits functionality across focused crates. Each crate does one thing.
+The dependency list is longer than in a bare-metal project because each Embassy crate does one thing.
 
 ```toml
 # Cargo.toml
@@ -154,7 +150,7 @@ edition = "2021"
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
 
 # Embassy RP2040 HAL: peripheral drivers for the RP2040
-embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
+embassy-rp = { version = "0.3", features = ["time-driver", "critical-section-impl", "rp2040"] }
 
 # Embassy time: Timer::after, Duration, Instant
 embassy-time = { version = "0.4", features = ["generic-queue-8"] }
@@ -165,7 +161,7 @@ embassy-sync = "0.6"
 # Embassy USB: USB device support
 embassy-usb = "0.4"
 
-# USB CDC ACM class (serial port)
+# Sends `log` crate messages over a USB CDC ACM serial port
 embassy-usb-logger = "0.4"
 
 # Cortex-M runtime
@@ -182,7 +178,7 @@ defmt-rtt = "0.4"
 # Fixed-point math (optional)
 fixed = "1.28"
 
-# Critical section implementation for single-core use
+# Atomic types for the Cortex-M0+ (built on the critical section from embassy-rp)
 portable-atomic = { version = "1.10", features = ["critical-section"] }
 static_cell = "2.1"
 
@@ -195,7 +191,7 @@ codegen-units = 1   # Better optimization, slower compile
 
 ### .cargo/config.toml
 
-This file tells Cargo to compile for the Cortex-M0+ target and to use the `probe-rs` runner for flashing.
+This file tells Cargo to compile for the Cortex-M0+ target and to use the `probe-rs` runner for flashing. The `link-rp.x` linker script comes from `embassy-rp` and places the boot2 bootloader at the start of flash; without it the board does not boot.
 
 ```toml
 # .cargo/config.toml
@@ -205,6 +201,7 @@ runner = "probe-rs run --chip RP2040 --protocol swd"
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 rustflags = [
     "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tlink-rp.x",
     "-C", "link-arg=-Tdefmt.x",
 ]
 
@@ -224,7 +221,7 @@ The linker script defines the RP2040's memory layout. The boot2 bootloader occup
 MEMORY {
     BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100
     FLASH : ORIGIN = 0x10000100, LENGTH = 2048K - 0x100
-    RAM   : ORIGIN = 0x20000000, LENGTH = 264K
+    RAM   : ORIGIN = 0x20000000, LENGTH = 256K
 }
 ```
 
@@ -242,19 +239,18 @@ fn main() {
 ```toml
 # rust-toolchain.toml
 [toolchain]
-channel = "nightly"
+channel = "stable"
 targets = ["thumbv6m-none-eabi"]
 components = ["rust-src", "rustfmt", "clippy"]
 ```
 
-Embassy requires nightly Rust because it uses several unstable features for optimal code generation on embedded targets.
+Embassy builds on stable Rust, the same toolchain you installed for the first blink. Nightly is only needed if you turn on the optional `nightly` feature of `embassy-executor`.
 
 ## Your First Async Blink
 
 <InArticleAd />
 
-
-Let us start with the simplest Embassy program: a single async task that blinks an LED. This establishes the basic structure that every Embassy application follows.
+The smallest Embassy program is one async task that blinks an LED. Every Embassy application has this structure.
 
 ```rust
 // src/main.rs - Minimal async blink
@@ -283,15 +279,15 @@ async fn main(_spawner: Spawner) {
 }
 ```
 
-Let us examine each part.
+Four lines need an explanation.
 
-**`#![no_std]` and `#![no_main]`**: This is a bare-metal program. There is no standard library and no `fn main()` entry point. The Embassy macro handles startup.
+`#![no_std]` and `#![no_main]`: this is a bare-metal program. There is no standard library and no ordinary `fn main()`. The Embassy macro does the startup.
 
-**`#[embassy_executor::main]`**: This attribute macro does three things. It creates the Embassy executor (the async runtime), initializes the Cortex-M0+ hardware, and turns the `async fn main` into the root task. The executor runs on the main thread and polls tasks when they are woken by interrupts.
+`#[embassy_executor::main]`: this macro creates the executor and makes `async fn main` the first task. From then on the executor polls a task each time an interrupt marks it as ready.
 
-**`embassy_rp::init(Default::default())`**: This call initializes all RP2040 clocks, resets peripherals, and returns a `Peripherals` struct. The `Peripherals` struct contains every hardware resource (pins, SPI blocks, I2C blocks, timers, etc.) as individually owned fields. You can move each field into exactly one task, enforced by the type system.
+`embassy_rp::init(Default::default())`: this call sets up the clocks and returns a `Peripherals` struct. Every hardware resource (each pin, each SPI block, each timer) is one field of it, and you can move a field into one task only.
 
-**`Timer::after_millis(500).await`**: This is where the magic happens. The task does not spin in a busy loop. It tells the executor "wake me up in 500 ms" and yields control. The executor puts the CPU into a low-power sleep until the timer interrupt fires. If other tasks existed, they could run during this wait.
+`Timer::after_millis(500).await`: `Timer::after_millis(500)` makes a future that finishes after 500 ms, and `.await` gives the processor back until then. Here there is no other task, so the executor puts the processor to sleep until the timer interrupt.
 
 ### Building and Flashing
 
@@ -317,8 +313,7 @@ Let us examine each part.
 
 <InArticleAd />
 
-
-A single blinking LED does not demonstrate concurrency. The real power of Embassy appears when you spawn multiple tasks that run independently. Each spawned task is an `async fn` with the `#[embassy_executor::task]` attribute.
+To spawn a task is to hand it to the executor, so that it starts to run beside the others. A task is an `async fn` marked with `#[embassy_executor::task]`.
 
 ```rust
 #![no_std]
@@ -364,36 +359,35 @@ async fn main(spawner: Spawner) {
 }
 ```
 
-Notice that `Output::new(p.PIN_15, Level::Low)` consumes `p.PIN_15`. After this line, `p.PIN_15` cannot be used again. This is Rust's ownership system preventing two tasks from driving the same pin. If you tried to pass `p.PIN_15` to both tasks, the compiler would reject it with a "use of moved value" error. In C, two FreeRTOS tasks could freely write to the same GPIO register without any warning.
+`Output::new(p.PIN_15, Level::Low)` takes ownership of `p.PIN_15`. If you pass the same pin to both tasks, the compiler stops with "use of moved value". In C, two FreeRTOS tasks can write to the same GPIO register with no warning.
+
+The type `Output<'static>` contains a new word. `'static` is a lifetime that means "valid for the whole run of the program". A spawned task may run at any later time and may never end, so everything it holds must stay valid for ever. A pin meets this, because it exists as long as the chip has power. A reference to a local variable of `main` does not.
 
 ### How the Executor Schedules Tasks
-
-The Embassy executor on Cortex-M0+ works as follows:
 
 <Steps>
 1. All spawned tasks are polled once at startup.
 
-2. Each task runs until it hits an `.await` on a future (like `Timer::after_millis`).
+2. Each task runs until it reaches an `.await` on a future that is not finished (such as `Timer::after_millis`).
 
-3. The future registers a waker with the hardware timer peripheral.
+3. The future leaves a waker with the timer. A waker is a small handle that means "mark this task as ready".
 
-4. The executor puts the CPU into WFI (Wait For Interrupt) sleep.
+4. When every task is waiting, the executor puts the processor to sleep with WFE (wait for event), an instruction that sleeps until an interrupt arrives.
 
-5. When the timer interrupt fires, the interrupt handler marks the corresponding task as ready.
+5. The timer interrupt fires, and its handler uses the waker to mark the task as ready.
 
-6. The executor wakes up and polls only the ready tasks.
+6. The executor wakes and polls only the tasks that are ready.
 
 7. Return to step 2.
 </Steps>
 
-This is fundamentally different from a preemptive RTOS. No task is ever interrupted mid-execution. A task runs as long as it wants until it cooperatively yields via `.await`. This eliminates an entire class of concurrency bugs (race conditions from preemption, priority inversion) but introduces a different constraint: you must never block for long without awaiting.
+Note what step 5 does not do: the interrupt marks the task, it does not run the task. If another task holds the processor at that moment, the ready task waits until that one reaches an `.await`. So the price of having no preemption is one rule: never run for long without an `.await`. A loop that calculates for 100 ms makes every other task up to 100 ms late.
 
 ## Embassy Time: Delays, Timeouts, and Tickers
 
 <InArticleAd />
 
-
-The `embassy-time` crate provides all time-related operations. Unlike `cortex_m::delay::Delay` (which busy-spins), Embassy's timers are interrupt-driven and allow other tasks to run during the wait.
+The `embassy-time` crate holds everything that has to do with time. `cortex_m::delay::Delay` counts in a loop and keeps the processor. An Embassy timer is driven by an interrupt, so other tasks run during the wait.
 
 ### Basic Delays
 
@@ -408,7 +402,7 @@ Timer::after_micros(100).await;
 
 ### Timeouts
 
-Wrap any future with a timeout. If the inner future does not complete within the deadline, `with_timeout` returns an error.
+A wait with no limit is a risk: a sensor that never answers stops its task for ever. `with_timeout` puts a limit on any future. If the future is not finished in time, `with_timeout` returns an error and the task continues.
 
 ```rust
 use embassy_time::{Timer, Duration, with_timeout};
@@ -426,10 +420,10 @@ match with_timeout(Duration::from_secs(5), wait_for_button_press()).await {
 
 ### Tickers for Periodic Tasks
 
-A `Ticker` fires at regular intervals, automatically compensating for the time your task spends processing. This is better than `Timer::after` for periodic work because it prevents drift.
+A loop that works for 30 ms and then waits 100 ms repeats every 130 ms, not every 100 ms, and the error adds up. A `Ticker` fires at fixed moments, so the time your task spends working is taken out of the wait.
 
 ```rust
-use embassy_time::Ticker;
+use embassy_time::{Duration, Ticker};
 
 #[embassy_executor::task]
 async fn sensor_reader() {
@@ -463,8 +457,9 @@ defmt::info!("Operation took {} ms", elapsed.as_millis());
 
 <InArticleAd />
 
+Two tasks cannot both write one variable freely, and Rust does not let them try. The usual way to pass data is a channel: a queue with a fixed number of places. One task puts messages in and another takes them out in the same order (FIFO, first in, first out). If the queue is full, `send(...).await` waits for a free place. If it is empty, `receive().await` waits for a message. Other tasks run during both waits.
 
-When tasks need to exchange data, Embassy provides `Channel` from `embassy_sync`. A channel is a fixed-size, statically allocated FIFO queue. The sender awaits if the channel is full; the receiver awaits if it is empty.
+The channel is declared `static`. A `static` is a variable that is made once, at a fixed address, and exists for the whole run. That is how two tasks can both reach it, and why it needs no heap.
 
 ```rust
 use embassy_sync::channel::Channel;
@@ -501,23 +496,13 @@ async fn led_task() {
 }
 ```
 
-Key properties of Embassy channels:
-
-| Property | Detail |
-|----------|--------|
-| Allocation | Static. The buffer is embedded in the `Channel` struct at compile time. |
-| Capacity | Fixed at compile time (the `4` in `Channel<..., 4>`). |
-| Blocking | Both `send` and `receive` are async. They yield, not spin. |
-| Multiple senders | Supported. Multiple tasks can send to the same channel. |
-| Multiple receivers | Supported, but only one receiver gets each message. |
-| No heap | The channel never allocates. |
+The `4` in `Channel<..., 4>` is the number of places, fixed at compile time. `CriticalSectionRawMutex` names how the channel protects its inside: it turns interrupts off for the few instructions of each access. Several tasks may send to one channel. Several may receive, but each message goes to only one of them.
 
 ## Inter-Task Communication: Signals
 
 <InArticleAd />
 
-
-A `Signal` is a simpler primitive than a channel. It holds a single value. If you signal multiple times before the receiver checks, only the latest value is kept. This is perfect for "current state" updates where you only care about the most recent value.
+A `Signal` is simpler than a channel: it holds one value. If the sender signals three times before the receiver looks, the receiver gets only the last value. Use a signal for "what is the state now", where an old value is worth nothing. Use a channel when every message counts.
 
 ```rust
 use embassy_sync::signal::Signal;
@@ -543,24 +528,21 @@ let pattern = PATTERN_SIGNAL.wait().await;
 
 <InArticleAd />
 
-
-The Tweede Golf embedded systems consultancy published benchmarks comparing Embassy to FreeRTOS on the same hardware (STM32, but the ratios apply to RP2040 as well). Their findings:
+The Tweede Golf embedded systems consultancy published benchmarks comparing Embassy to FreeRTOS on the same hardware (an STM32F446 at 180 MHz, in 2022; expect similar ratios, not the same numbers, on the RP2040). Their findings:
 
 | Metric | FreeRTOS | Embassy | Ratio |
 |--------|----------|---------|-------|
-| Flash usage (3 tasks) | ]+26.7 KB | 18.4 KB | Embassy is 69% |
-| RAM usage (3 tasks) | 11.2 KB | 1.7 KB | Embassy is 15% |
-| Context switch time | 4.2 us | 0.8 us | Embassy is 5x faster |
-| Interrupt latency | 1.1 us | 0.3 us | Embassy is 3.7x faster |
+| Program size (flash) | 20,676 bytes | 14,272 bytes | Embassy is 69% |
+| Static memory (RAM) | 5,480 bytes | 872 bytes | Embassy is 16% |
+| Interrupt time (average) | 2.962 us | 1.450 us | Embassy is 2.0x faster |
+| Thread time (average) | 16.19 us | 11.64 us | Embassy is 1.4x faster |
+| Interrupt latency (average) | 4.973 us | 3.738 us | Embassy is 1.3x faster |
 
-The RAM savings come from eliminating per-task stacks. In FreeRTOS, each of the 3 tasks might need a 2 KB stack (6 KB total), plus the kernel heap (4 KB), plus TCBs. In Embassy, all 3 tasks share the main stack, and their state machines total about 400 bytes because the compiler only stores the variables that are live across `.await` points.
-
-For an RP2040 with 264 KB of SRAM, this might not seem critical for 3 tasks. But scale to 10 or 20 tasks (common in production IoT firmware), and FreeRTOS can consume 40+ KB of RAM just for stacks, while Embassy stays under 5 KB. That leaves more RAM for buffers, protocol stacks, and sensor data.
+The RAM saving comes from the missing per-task stacks. On an RP2040 with 264 KB of SRAM this matters little for 3 tasks. With 10 or 20 tasks, FreeRTOS can use more than 40 KB for stacks alone, while Embassy stays under 5 KB, and the difference is free for buffers and sensor data.
 
 ## C vs Rust: FreeRTOS Task vs Embassy Async Task
 
 <InArticleAd />
-
 
 <Tabs>
 <TabItem label="C (FreeRTOS)">
@@ -667,43 +649,37 @@ async fn main(spawner: Spawner) {
 
 // Total RAM for 2 tasks: ~32 bytes of state machines
 // + shared main stack (~2 KB, used by all tasks sequentially)
-// Pin conflicts are impossible. Stack overflow is impossible.
+// Pin conflicts are impossible. There are no per-task stacks to size.
 ```
 
 </TabItem>
 </Tabs>
 
-The C version requires you to guess stack sizes, manually avoid GPIO conflicts, and hope that no task overflows its stack at runtime. The Rust version makes all three impossible at compile time. The stack size is calculated by the compiler, GPIO ownership is enforced by the type system, and there is only one stack (the main stack) that is never overflowed because async tasks do not use the call stack across yield points.
+In the C version you guess the stack sizes and keep two tasks away from one pin by discipline. In the Rust version the compiler does both, and there is one stack to size, because an async task keeps nothing on the call stack while it waits.
 
 ## Complete Project: Multi-Task System
 
 <InArticleAd />
 
-
-Now we combine everything into a complete, working project with three concurrent tasks communicating through channels and signals.
+The project has three tasks. They pass data through one channel and one signal.
 
 ### System Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Embassy Executor                      │
-│                                                         │
-│  ┌──────────────┐    Channel     ┌───────────────────┐  │
-│  │ Button Task   │──────────────>│ Reporter Task      │  │
-│  │ (GP14 input)  │              │ (USB serial out)   │  │
-│  │               │    Signal    │                     │  │
-│  │               │─────────────>│                     │  │
-│  └──────────────┘     │         └───────────────────┘  │
-│                       │ Signal                          │
-│                       v                                 │
-│               ┌──────────────┐                          │
-│               │ Blinker Task  │                          │
-│               │ (GP15 LED)    │                          │
-│               └──────────────┘                          │
-└─────────────────────────────────────────────────────────┘
+```text
+ ┌────────────────┐   channel    ┌─────────────────┐
+ │  Button task   ├─────────────>│  Reporter task  │
+ │  (GP14 input)  │ ButtonEvent  │  (log output)   │
+ └───────┬────────┘              └─────────────────┘
+         │ signal
+         │ BlinkPattern
+         v
+ ┌────────────────┐
+ │  Blinker task  │
+ │  (GP15 LED)    │
+ └────────────────┘
 ```
 
-The button task detects short and long presses. A short press sends a `ButtonEvent` through the channel to the reporter task. A long press sends a `BlinkPattern` through the signal to the blinker task.
+The button task measures how long the button is held. Every press sends a `ButtonEvent` through the channel to the reporter task, because no press may be lost. A long press also sends the next `BlinkPattern` through the signal to the blinker task, which needs only the newest pattern.
 
 ### Full Source Code
 
@@ -819,6 +795,7 @@ async fn blinker_task(mut led: Output<'static>) {
 #[embassy_executor::task]
 async fn button_task(mut button: Input<'static>) {
     let mut press_count: u32 = 0;
+    let mut pattern = BlinkPattern::Slow; // The pattern the blinker is using
 
     loop {
         // Wait for button press (falling edge, since active-low)
@@ -844,8 +821,8 @@ async fn button_task(mut button: Input<'static>) {
         if press_duration.as_millis() > 1000 {
             // Long press: change blink pattern
             press_count += 1;
-            let current = PATTERN_SIGNAL.try_take().unwrap_or(BlinkPattern::Slow);
-            let next = current.next();
+            let next = pattern.next();
+            pattern = next;
             PATTERN_SIGNAL.signal(next);
             BUTTON_CHANNEL.send(ButtonEvent::LongPress).await;
             defmt::info!(
@@ -942,28 +919,27 @@ async fn main(spawner: Spawner) {
 
 ### How the Tasks Interact
 
-Let us trace through a typical scenario to see how the tasks cooperate.
+Follow one typical run.
 
 <Steps>
-1. **Startup**: The executor spawns all three tasks. Each runs until its first `.await`. The blinker starts its first `Timer::after_millis(500)`. The button task starts `wait_for_falling_edge()`. The reporter starts its `with_timeout(2s, receive())`. All three are now waiting, and the CPU enters WFI sleep.
+1. **Startup**: The executor polls all three tasks. Each runs until its first `.await`. The blinker starts its first `Timer::after_millis(500)`. The button task starts `wait_for_falling_edge()`. The reporter starts its `with_timeout(2s, receive())`. All three now wait, and the processor sleeps.
 
-2. **500 ms later**: The timer interrupt fires. The blinker task wakes, toggles the LED, and immediately starts the next `Timer::after_millis(500)`. The button and reporter tasks remain asleep. Total CPU time: microseconds.
+2. **500 ms later**: The timer interrupt fires. The blinker task runs, changes the LED, and starts the next `Timer::after_millis(500)`. The other two tasks stay asleep. Processor time used: microseconds.
 
-3. **User presses the button**: The GPIO interrupt fires on the falling edge. The button task wakes, waits 20 ms for debounce, then measures the press duration.
+3. **The user presses the button**: The GPIO interrupt fires on the falling edge. The button task waits 20 ms and reads the pin again, because a mechanical contact bounces for some milliseconds and one press must not count as several (this is debounce). Then it notes the time.
 
-4. **User releases after 200 ms (short press)**: The button task sends `ButtonEvent::ShortPress` through `BUTTON_CHANNEL`. This immediately wakes the reporter task (which was blocked on `receive()`). The reporter increments its counter and prints the status.
+4. **The user releases after 200 ms (short press)**: The button task sends `ButtonEvent::ShortPress` through `BUTTON_CHANNEL`. This marks the reporter task as ready. The reporter runs when the button task reaches its next `.await`, adds one to its counter and prints the status.
 
-5. **User holds for 2 seconds (long press)**: The button task sends `BlinkPattern::Fast` through `PATTERN_SIGNAL` and `ButtonEvent::LongPress` through the channel. The blinker task picks up the new pattern on its next loop iteration. The reporter records the long press.
+5. **The user holds for 2 seconds (long press)**: The button task sends `BlinkPattern::Fast` through `PATTERN_SIGNAL` and `ButtonEvent::LongPress` through the channel. The blinker looks at the signal only at the start of a cycle, so the LED changes when the current cycle ends, up to one second later.
 
-6. **No button presses for 2 seconds**: The reporter's `with_timeout` expires. It prints a status report anyway (uptime, press counts) and loops back to wait again.
+6. **No press for 2 seconds**: The reporter's `with_timeout` expires. It prints a status report (uptime, press counts) and waits again.
 </Steps>
 
 ## Adding USB Serial Output
 
 <InArticleAd />
 
-
-The defmt/RTT output in the previous example requires a debug probe. For standalone operation, you can add USB CDC serial output so the Pico appears as a serial port on your computer.
+The `defmt::info!` lines of the project need a debug probe. For a board that stands alone you can add USB CDC, the USB class that makes the Pico appear as a serial port on your computer. The listing below shows the parts you add. It is a sketch, not a complete program.
 
 ```rust
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
@@ -1013,12 +989,11 @@ fn format_status(buf: &mut [u8; 128], uptime: u64) -> &str {
 }
 ```
 
-For a complete USB serial implementation, the `embassy-usb-logger` crate provides a simple `log::info!()` macro that sends text over USB CDC automatically.
+For a complete USB serial implementation, the `embassy-usb-logger` crate sends the text of `log::info!()` calls (from the `log` crate) over USB CDC automatically.
 
 ## Production Notes on Async Patterns
 
 <InArticleAd />
-
 
 ### When to Use Channels vs Signals
 
@@ -1032,7 +1007,7 @@ For a complete USB serial implementation, the `embassy-usb-logger` crate provide
 
 ### Avoiding Starvation
 
-Because Embassy is cooperative, a task that never awaits will block all other tasks. Common mistakes:
+A task that never awaits stops all other tasks, and the compiler does not warn you. The usual form of the mistake, and its repair:
 
 ```rust
 // BAD: This loop never awaits. All other tasks starve.
@@ -1057,7 +1032,7 @@ async fn compute_task() {
 
 ### Static Allocation Only
 
-Embassy tasks must be `'static`, meaning they cannot borrow local variables from `main`. All shared state must either be moved into a task (ownership transfer) or placed in a `static` variable. This is why the channels and signals above are declared as `static`.
+Everything a task holds must be `'static`, so a task cannot borrow a local variable of `main`. You either move the data into the task, or you put it in a `static` variable, as the channel and the signal above. A `StaticCell` is a `static` place that is empty at first: you fill it once during the run, and it gives back a reference that is valid for ever.
 
 ```rust
 // This will NOT compile:
@@ -1065,7 +1040,7 @@ Embassy tasks must be `'static`, meaning they cannot borrow local variables from
 async fn main(spawner: Spawner) {
     let mut buffer = [0u8; 256];
     spawner.spawn(my_task(&mut buffer)).unwrap();
-    // Error: borrowed value does not live long enough
+    // error[E0597]: `buffer` does not live long enough
 }
 
 // This WILL compile: buffer is static
@@ -1080,7 +1055,7 @@ async fn main(spawner: Spawner) {
 
 ### Shared Mutable State with Mutex
 
-When two tasks need to read and write the same data, use `embassy_sync::mutex::Mutex`:
+When two tasks must read and write the same data, put it in a mutex, a lock that one task can hold at a time (`embassy_sync::mutex::Mutex`):
 
 ```rust
 use embassy_sync::mutex::Mutex;
@@ -1130,12 +1105,11 @@ async fn reader_task() {
 }
 ```
 
-The `Mutex` in Embassy is async-aware. If a task tries to lock a mutex that is already held, it `.await`s until the mutex is released, yielding to other tasks in the meantime. This is impossible to deadlock in a single-executor system because the holder will eventually reach an `.await` and release the lock.
+If a task asks for a mutex that another task holds, `lock().await` waits, and other tasks run during the wait. The lock is released when the guard (`state` above) goes out of scope, not at an `.await`. A task that awaits a timer while it holds the lock keeps every other user out for that whole time, so keep each locked block short, as shown. If a task needs two mutexes, always lock them in the same order. Otherwise two tasks can each hold one and wait for the other for ever (a deadlock).
 
 ## Testing
 
 <InArticleAd />
-
 
 <Steps>
 1. Build the project:
@@ -1178,12 +1152,9 @@ The `Mutex` in Embassy is async-aware. If a task tries to lock a mutex that is a
 
 <InArticleAd />
 
-
-Embassy transforms embedded programming by replacing the RTOS model (pre-allocated stacks, heap-managed tasks, runtime scheduling) with compiler-generated state machines that share a single stack. You write sequential-looking code with `async`/`await`, and the compiler ensures memory safety, prevents pin conflicts, and calculates exact RAM usage at build time. The executor sleeps the CPU between events, achieving both low power consumption and responsive concurrency. In the next lesson, we will use Embassy's async I2C and SPI drivers to communicate with external sensors and displays, taking full advantage of the `embedded-hal` trait system for portable driver code.
+An async task gives the processor back at every `.await`. The executor runs whichever task is ready and sleeps when none is. The compiler stores each task as a small state machine, so all tasks share one stack. A channel carries every message in order, a signal carries only the newest value, and both are `static`. The rule to remember: a task that never awaits stops all the others. Sensors and displays come next, in [I2C and SPI with embedded-hal](/education/embedded-rust-rp2040/i2c-spi-embedded-hal/).
 
 <EmbeddedRustRp2040Comments />
-
-
 
 <InArticleAd />
 <TawkWidget />

@@ -90,47 +90,47 @@ Each lesson follows a consistent cycle:
 
 <CardGrid>
   <Card title="Lesson 1: Rust Toolchain and First Blink" icon="star">
-    [Rust Toolchain and First Blink](./rust-toolchain-first-blink). Install Rust, probe-rs, and flip-link. Create your first rp2040 project with Cargo, understand Cargo.toml dependencies, memory.x, and .cargo/config.toml. Build a blinking LED with defmt logging over RTT.
+    [Rust Toolchain and First Blink](/education/embedded-rust-rp2040/rust-toolchain-first-blink/). Install Rust, probe-rs, and flip-link. Create your first rp2040 project with Cargo, understand Cargo.toml dependencies, memory.x, and .cargo/config.toml. Build a blinking LED with defmt logging over RTT.
     **Build:** Blinking LED with RTT logging. **Parts:** Raspberry Pi Pico, debug probe, LED, resistor.
   </Card>
 
   <Card title="Lesson 2: Ownership, Borrowing, and Hardware" icon="document">
-    [Ownership, Borrowing, and Hardware](./ownership-borrowing-hardware). Learn how Rust's ownership model maps to hardware peripherals. Typestate GPIO, button debouncing with owned state, error handling with Result, and safe access to shared resources with Mutex and critical sections.
+    [Ownership, Borrowing, and Hardware](/education/embedded-rust-rp2040/ownership-borrowing-hardware/). Learn how Rust's ownership model maps to hardware peripherals. Typestate GPIO, button debouncing with owned state, error handling with Result, and safe access to shared resources with Mutex and critical sections.
     **Build:** Button-toggled LED with debounce. **Parts:** Push button, LED, resistors.
   </Card>
 
   <Card title="Lesson 3: Timers, PWM, and Interrupts" icon="document">
-    [Timers, PWM, and Interrupts](./timers-pwm-interrupts). Configure RP2040 timers, generate servo PWM, handle interrupts with the critical-section crate, and read analog inputs. Build a pot-controlled servo with buzzer feedback.
+    [Timers, PWM, and Interrupts](/education/embedded-rust-rp2040/timers-pwm-interrupts/). Configure RP2040 timers, generate servo PWM, handle interrupts with the critical-section crate, and read analog inputs. Build a pot-controlled servo with buzzer feedback.
     **Build:** Potentiometer-controlled servo with buzzer. **Parts:** SG90 servo, potentiometer, piezo buzzer.
   </Card>
 
   <Card title="Lesson 4: I2C, SPI, and embedded-hal Drivers" icon="document">
-    [I2C, SPI, and embedded-hal Drivers](./i2c-spi-embedded-hal). Use embedded-hal traits to interface a BME280 sensor over I2C and an SSD1306 OLED over I2C/SPI. Understand how trait-based drivers enable cross-platform portability.
+    [I2C, SPI, and embedded-hal Drivers](/education/embedded-rust-rp2040/i2c-spi-embedded-hal/). Use embedded-hal traits to interface a BME280 sensor over I2C and an SSD1306 OLED over I2C/SPI. Understand how trait-based drivers enable cross-platform portability.
     **Build:** Environmental sensor dashboard on OLED. **Parts:** BME280, SSD1306 OLED.
   </Card>
 
-  <Card title="Lesson 5: UART, DMA, and292Data Pipelines" icon="document">
-    [UART, DMA, and Data Pipelines](./uart-dma-data-pipelines). Parse GPS NMEA sentences over UART, log data to a microSD card over SPI, and use DMA for efficient data movement without CPU polling.
+  <Card title="Lesson 5: UART, DMA, and Ownership" icon="document">
+    [UART, DMA, and Ownership](/education/embedded-rust-rp2040/uart-dma-ownership/). Parse GPS NMEA sentences over UART, log data to a microSD card over SPI, and use DMA for efficient data movement without CPU polling.
     **Build:** GPS data logger with SD storage. **Parts:** NEO-6M GPS module, microSD module.
   </Card>
 
-  <Card title="Lesson 6: Embassy Async Runtime" icon="document">
-    [Embassy Async Runtime](./embassy-async-runtime). Transition from polling to async/await with Embassy. Understand the executor, async tasks, timers, and channels. Rebuild earlier projects as concurrent async tasks.
+  <Card title="Lesson 6: Embassy Async Fundamentals" icon="document">
+    [Embassy Async Fundamentals](/education/embedded-rust-rp2040/embassy-async-fundamentals/). Transition from polling to async/await with Embassy. Understand the executor, async tasks, timers, and channels. Rebuild earlier projects as concurrent async tasks.
     **Build:** Multitask sensor dashboard (async). **Parts:** Reuse existing.
   </Card>
 
-  <Card title="Lesson 7: Embassy Networking with Pico W" icon="document">
-    [Embassy Networking with Pico W](./embassy-networking-pico-w). Use embassy-net and the CYW43 driver for Wi-Fi connectivity. TCP sockets, HTTP serving, and MQTT publishing. Build a wireless sensor node.
+  <Card title="Lesson 7: Wi-Fi and Networking (Pico W)" icon="document">
+    [Wi-Fi and Networking (Pico W)](/education/embedded-rust-rp2040/wifi-networking-pico-w/). Use embassy-net and the CYW43 driver for Wi-Fi connectivity. TCP sockets, HTTP serving, and MQTT publishing. Build a wireless sensor node.
     **Build:** Wi-Fi sensor node with MQTT. **Parts:** Pico W (swap from Pico).
   </Card>
 
-  <Card title="Lesson 8: PIO in Rust" icon="document">
-    [PIO in Rust](./pio-in-rust). Program the RP2040's Programmable I/O state machines from Rust using pio-rs. Drive WS2812B NeoPixel LEDs and implement custom protocols with PIO programs compiled at build time.
-    **Build:** NeoPixel LED strip controller. **Parts:** WS2812B LED strip (8 pixels).
+  <Card title="Lesson 8: USB Device with embassy-usb" icon="document">
+    [USB Device with embassy-usb](/education/embedded-rust-rp2040/usb-device-embassy/). Build USB serial and keyboard devices on the RP2040 with embassy-usb, then combine them into one composite device.
+    **Build:** a virtual serial port that reports sensor data, and a USB keyboard that sends a key for each button press. **Parts:** Pico, push buttons, USB cable.
   </Card>
 
   <Card title="Lesson 9: Async Sensor Hub Project" icon="document">
-    [Async Sensor Hub Project](./async-sensor-hub-project). Combine everything into a production-quality firmware: async tasks, sensor reading, display output, wireless reporting, SD card logging, and alarm outputs. Build a complete environmental monitoring station.
+    [Async Sensor Hub Project](/education/embedded-rust-rp2040/async-sensor-hub-project/). Combine everything into a production-quality firmware: async tasks, sensor reading, display output, wireless reporting, SD card logging, and alarm outputs. Build a complete environmental monitoring station.
     **Build:** Wireless environmental monitor with OLED, SD card, MQTT. **Parts:** Reuse all parts.
   </Card>
 </CardGrid>

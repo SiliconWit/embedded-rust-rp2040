@@ -21,16 +21,14 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
   contributors={frontmatter.contributors}
 />
 
-
-
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-Interrupts are where embedded Rust diverges most sharply from C. In C, you write an ISR, declare some globals as `volatile`, and hope you got the synchronization right. Rust refuses to compile code with unsynchronized global mutable state. This forces you into patterns (critical sections, Mutex wrappers, atomic types) that are safer and, once you learn them, just as efficient. In this lesson, you will configure the RP2040's PWM hardware to drive a servo, read a potentiometer through the ADC, handle timer interrupts for buzzer tone generation, and wire it all together into a responsive servo controller with audio feedback. #RP2040 #PWM #Interrupts
+A variable shared between the main loop and an interrupt handler (ISR, interrupt service routine) is the source of the faults that appear once a week and never on the bench. In C you mark the variable `volatile` and hope that the interrupt never arrives at the wrong moment. Rust does not compile a global variable that both sides can change freely, so you must say how it is protected: a critical section, a Mutex, or an atomic type. In this lesson you drive a servo with PWM hardware, read a potentiometer with the ADC, and write a timer interrupt that plays a tone on a buzzer, with the shared data protected in a way the compiler can check. #RP2040 #PWM #Interrupts
 
 ## What We Are Building
 
 <Card title="Potentiometer-Controlled Servo with Buzzer Feedback" icon="star">
-A potentiometer on ADC0 (GP26) sets the angle of an SG90 servo motor driven by PWM on GP0. A piezo buzzer on GP18 plays a short tone that changes pitch proportionally to the servo angle: low angle gives a low pitch, high angle gives a high pitch. A timer interrupt generates the buzzer frequency. The main loop reads the ADC, updates the servo PWM duty cycle, and communicates the desired buzzer frequency to the interrupt handler through a Mutex-protected static variable.
+A potentiometer on GP26 sets the angle of an SG90 servo, driven by PWM (pulse width modulation) on GP0. A piezo buzzer on GP18 plays a tone that rises with the angle. The main loop reads the potentiometer with the ADC (analog to digital converter) and sets the servo pulse. A timer interrupt switches the buzzer pin to make the tone. The main loop tells the interrupt handler which tone to play through a variable protected by a Mutex.
 </Card>
 
 **Project specifications:**
@@ -41,7 +39,7 @@ A potentiometer on ADC0 (GP26) sets the angle of an SG90 servo motor driven by P
 | Servo pin | GP0 (PWM0A, slice 0, channel A) |
 | Servo signal | 50 Hz, 0.5 ms to 2.5 ms pulse width |
 | Potentiometer | GP26 (ADC0), 10K linear |
-| Buzzer pin | GP18 (PWM1A, slice 1, channel A) |
+| Buzzer pin | GP18 (GPIO output, toggled by the timer interrupt) |
 | Buzzer frequency range | 200 Hz to 2000 Hz |
 | Timer interrupt | TIMER_IRQ_0, periodic at variable rate |
 | ADC resolution | 12-bit (0 to 4095) |
@@ -50,12 +48,12 @@ A potentiometer on ADC0 (GP26) sets the angle of an SG90 servo motor driven by P
 
 | Component | Quantity | Notes |
 |-----------|----------|-------|
-| Raspberry Pi Pico | 1 | From previous lessons |
-| Debug probe | 1 | From previous lessons |
+| Raspberry Pi Pico | 1 | As for the first blink |
+| Debug probe | 1 | As for the first blink |
 | SG90 micro servo | 1 | 4.8 to 6V, standard hobby servo |
 | Potentiometer (10K linear) | 1 | Rotary or slider |
 | Piezo buzzer (passive) | 1 | Must be passive (not active/self-oscillating) |
-| Breadboard + jumper wires | 1 set | From previous lessons |
+| Breadboard + jumper wires | 1 set | |
 | External 5V supply (optional) | 1 | For servo if USB power is insufficient |
 
 ### Wiring Table
@@ -64,7 +62,7 @@ A potentiometer on ADC0 (GP26) sets the angle of an SG90 servo motor driven by P
 |----------|------------|-------|
 | GP0 | Servo signal (orange/yellow wire) | PWM output for servo |
 | GP26 (ADC0) | Potentiometer wiper (center pin) | Analog input |
-| GP18 | Piezo buzzer (positive lead) | PWM output for tone |
+| GP18 | Piezo buzzer (positive lead) | GPIO output for tone (toggled by the timer interrupt) |
 | 3V3(OUT) | Potentiometer one end | ADC reference voltage |
 | VSYS (5V) | Servo power (red wire) | Or use external 5V |
 | GND | Pot other end, servo GND, buzzer GND | Common ground |
@@ -77,82 +75,51 @@ The SG90 draws up to 500 mA under load. USB power may cause the Pico to brown ou
 
 <InArticleAd />
 
+A hobby servo reads its target angle from the width of a pulse: 0.5 ms means 0 degrees and 2.5 ms means 180 degrees, repeated every 20 ms. A pulse that is 0.1 ms wrong moves the arm by 9 degrees, so the timing cannot depend on what the program is doing. The PWM hardware makes the pulse with a counter and needs no CPU time.
 
-The RP2040 has 8 PWM slices, each with two output channels (A and B). Each slice has a 16-bit counter, a configurable divider (integer + 4-bit fractional), and independent duty cycle registers for each channel. Both channels in a slice share the same frequency (determined by the counter wrap value) but can have different duty cycles.
+The RP2040 has 8 PWM blocks, called slices. In each slice a divider slows the system clock, and a 16-bit counter counts from 0 to a top value (wrap) and starts again. Each of the two outputs, A and B, is high while the counter is below its own compare value. So the two outputs of a slice share one frequency and can have different pulse widths.
 
 ```text
-  PWM Slice Architecture (one of 8 slices)
-  ──────────────────────────────────────────
-  125 MHz       ┌──────────┐    ┌─────────────┐
-  system ──────►│ Divider  │───►│ 16-bit      │
-  clock         │ int+frac │    │ Counter     │
-                └──────────┘    │ (0..wrap)   │
-                                └──────┬──────┘
-                                       │ compare
-                          ┌────────────┼────────────┐
-                          ▼                         ▼
-                   ┌─────────────┐           ┌─────────────┐
-                   │ Channel A   │           │ Channel B   │
-                   │ duty_a reg  │           │ duty_b reg  │
-                   └──────┬──────┘           └──────┬──────┘
-                          ▼                         ▼
-                     GPIO pin A                GPIO pin B
-                   (e.g. GP0)                (e.g. GP1)
-
-  Frequency = 125 MHz / (divider * (wrap + 1))
-  Duty cycle = duty_x / (wrap + 1) * 100%
+  125 MHz      ┌─────────┐   ┌───────────┐
+  system ─────►│ Divider │──►│ Counter   │
+  clock        └─────────┘   │ 0 .. wrap │
+                             └─────┬─────┘
+                    ┌──────────────┴─────┐
+                    ▼                    ▼
+             ┌────────────┐       ┌────────────┐
+             │ Compare A  │       │ Compare B  │
+             └─────┬──────┘       └─────┬──────┘
+                   ▼                    ▼
+               pin A (GP0)          pin B (GP1)
 ```
 
 ### PWM Slice Mapping
 
-Every GPIO pin on the RP2040 can be assigned to a specific PWM slice and channel. The mapping follows a fixed pattern:
+Each GPIO pin belongs to one slice and one channel. The slice is the pin number divided by 2, with the fraction dropped, and it starts again from 0 at GP16. Even pins are channel A and odd pins are channel B. So GP0 is slice 0 channel A, GP1 is slice 0 B, GP15 is slice 7 B, and GP16 is slice 0 A again.
 
-| GPIO | PWM Slice | Channel |
-|------|-----------|---------|
-| GP0, GP16 | Slice 0 | A |
-| GP1, GP17 | Slice 0 | B |
-| GP2, GP18 | Slice 1 | A |
-| GP3, GP19 | Slice 1 | B |
-| GP4, GP20 | Slice 2 | A |
-| GP5, GP21 | Slice 2 | B |
-| GP6, GP22 | Slice 3 | A |
-| GP7, GP23 | Slice 3 | B |
-| GP8, GP24 | Slice 4 | A |
-| GP9, GP25 | Slice 4 | B |
-| GP10, GP26 | Slice 5 | A |
-| GP11, GP27 | Slice 5 | B |
-| GP12, GP28 | Slice 6 | A |
-| GP13, GP29 | Slice 6 | B |
-| GP14 | Slice 7 | A |
-| GP15 | Slice 7 | B |
-
-For this project, GP0 uses slice 0 channel A (servo) and GP18 uses slice 1 channel A (buzzer).
+In this project the servo on GP0 uses slice 0 channel A. GP18 could use slice 1 channel A, but here the buzzer pin is a plain GPIO output that a timer interrupt switches.
 
 ### PWM Frequency Calculation
 
-The RP2040 system clock runs at 125 MHz. The PWM counter frequency is:
+Two settings fix the frequency. The divider sets how fast the counter counts, and the wrap value sets how far it counts before it starts again. With the system clock $f_{sys}$ = 125 MHz, the counter frequency is:
 
 $$
 f_{counter} = \frac{f_{sys}}{divider}
 $$
 
-The PWM output frequency depends on the wrap (top) value:
+The counter takes $wrap + 1$ counts for one period (it counts from 0), so the output frequency is:
 
 $$
 f_{pwm} = \frac{f_{counter}}{wrap + 1}
 $$
 
-For a 50 Hz servo signal with a 125 MHz system clock:
+A servo needs 50 Hz, a period of 20 ms. A divider of 125 gives a counter frequency of 125 MHz / 125 = 1 MHz, so one count is 1 microsecond. A period of 20 ms is then 20,000 counts, and the wrap value is 19999:
 
 $$
-divider = 125, \quad f_{counter} = 1 \text{ MHz}, \quad wrap = 19999
+f_{pwm} = \frac{1{,}000{,}000 \text{ Hz}}{19999 + 1} = 50 \text{ Hz}
 $$
 
-$$
-f_{pwm} = \frac{1{,}000{,}000}{20{,}000} = 50 \text{ Hz}
-$$
-
-The duty cycle is set by the channel compare value (0 to wrap). For servo control, the pulse width maps to:
+One count is 1 microsecond, so the compare value is the pulse width in microseconds:
 
 | Servo Angle | Pulse Width | Compare Value (at 1 MHz counter) |
 |-------------|-------------|----------------------------------|
@@ -163,7 +130,6 @@ The duty cycle is set by the channel compare value (0 to wrap). For servo contro
 ## Servo PWM Configuration
 
 <InArticleAd />
-
 
 ```rust
 use rp2040_hal::pwm::{FreeRunning, Pwm0, Slices};
@@ -178,7 +144,7 @@ fn setup_servo_pwm(
 }
 ```
 
-The rp2040-hal provides typed access to PWM slices. Each slice is a separate type (`Pwm0`, `Pwm1`, etc.), and the channel configuration follows the same typestate pattern as GPIO: you call `.into_mode::<FreeRunning>()` to switch the slice into free-running mode, which consumes the idle-mode slice.
+The listing above is an outline only; the working code is in the complete project below. In rp2040-hal each slice has its own type (`Pwm0`, `Pwm1`, and so on), and the mode of a slice is part of its type, as with GPIO pins: a slice starts in free-running mode (`FreeRunning`), and `.into_mode::<...>()` takes the slice and returns it in the new mode.
 
 ### Setting the Duty Cycle for a Specific Angle
 
@@ -196,15 +162,14 @@ fn angle_to_duty(angle: u16) -> u16 {
 
 <InArticleAd />
 
-
-The RP2040 has a 12-bit SAR ADC with 5 input channels: 4 external (ADC0 to ADC3 on GP26 to GP29) and 1 internal temperature sensor. The ADC runs at up to 500 ksps and produces values from 0 (0V) to 4095 (3.3V).
+The ADC of the RP2040 turns a voltage into a 12-bit number: 0 for 0 V up to 4095 for 3.3 V. It has 5 inputs: ADC0 to ADC3 on GP26 to GP29, and an internal temperature sensor. It takes up to 500,000 samples per second.
 
 ```rust
 use rp2040_hal::adc::Adc;
 
 /// Read ADC channel 0 (GP26) and return a 12-bit value (0 to 4095).
 fn read_pot(adc: &mut Adc, adc_pin: &mut hal::adc::AdcPin<
-    hal::gpio::Pin<hal::gpio::bank0::Gpio26, hal::gpio::FunctionNull, hal::gpio::PullNone>,
+    hal::gpio::Pin<hal::gpio::bank0::Gpio26, hal::gpio::FunctionNull, hal::gpio::PullDown>,
 >) -> u16 {
     adc.read(adc_pin).unwrap()
 }
@@ -212,7 +177,7 @@ fn read_pot(adc: &mut Adc, adc_pin: &mut hal::adc::AdcPin<
 
 ### Mapping ADC to Servo Angle
 
-The potentiometer produces a 12-bit value. We map it to 0 through 180 degrees:
+Scale the reading to 0 through 180 degrees. A reading of 2048 gives 2048 × 180 / 4095 = 90 degrees:
 
 ```rust
 /// Map a 12-bit ADC value (0 to 4095) to a servo angle (0 to 180).
@@ -225,12 +190,11 @@ fn adc_to_angle(adc_value: u16) -> u16 {
 
 <InArticleAd />
 
-
-This is where Rust embedded code differs most from C. In C, you declare an ISR function, use `volatile` globals to share data, and hope you got it right. Rust requires you to use safe patterns for sharing data between the main loop and interrupt handlers.
+The buzzer tone comes from a timer interrupt: each time it fires, the handler switches the pin and sets the next alarm. The main loop decides the pitch, so the two must share a variable.
 
 ### Why Rust Interrupts Are Different
 
-In C, interrupt handlers access global mutable state freely:
+In C, an interrupt handler reads and writes global variables freely:
 
 ```c
 // C: common ISR pattern
@@ -246,14 +210,19 @@ void TIMER_IRQ_0_Handler(void) {
 }
 ```
 
-This works, but the compiler provides no help verifying correctness:
-- What if `tone_half_period_us` is written from the main loop while the ISR reads it?
-- What if the ISR reads a partially-updated 32-bit value on a 32-bit bus? (This specific case is atomic on Cortex-M, but the compiler does not know that.)
-- What if another developer adds a second variable that must be updated atomically with the first?
+This works, but the compiler checks nothing:
+- The main loop may write `tone_half_period_us` while the ISR reads it. One 32-bit write happens to be a single step on a Cortex-M, but the compiler does not know or check that.
+- When someone adds a second variable that must change together with the first, the ISR can fire between the two writes.
 
-Rust refuses to compile this pattern. Global mutable state requires explicit synchronization.
+Rust does not compile this pattern. A global variable that can change must be protected.
 
 ### The Rust ISR Pattern
+
+An interrupt handler takes no arguments, so everything it uses must be a global (`static`). Each shared item is wrapped three times, and each wrapper answers one question:
+
+- `Mutex`: who may touch it now? Only code inside a critical section (interrupts off), which holds the token `cs`.
+- `RefCell`: how can a global declared without `mut` change? It allows the change and checks the rule of one writer at run time.
+- `Option`: what is in the global before `main()` has set the peripheral up? `None`. In C the handler would use a peripheral that is not ready, or a NULL pointer. Here it must test for `Some` first, with `if let Some(...)`.
 
 ```rust
 use core::cell::RefCell;
@@ -288,7 +257,7 @@ fn TIMER_IRQ_0() {
             if half_period > 0 {
                 // Toggle the buzzer pin
                 if let Some(ref mut pin) = *BUZZER_PIN.borrow_ref_mut(cs) {
-                    // Toggle using XOR on the GPIO output register
+                    // Toggle: read the output state, then write the opposite
                     let current = pin.is_set_high().unwrap_or(false);
                     if current {
                         pin.set_low().unwrap();
@@ -296,11 +265,14 @@ fn TIMER_IRQ_0() {
                         pin.set_high().unwrap();
                     }
                 }
-
-                // Schedule next alarm
-                let next = timer.timerawl().read().bits().wrapping_add(half_period);
-                timer.alarm0().write(|w| unsafe { w.bits(next) });
             }
+
+            // Schedule the next alarm. An alarm fires only once, so it
+            // must always be re-armed. While the buzzer is off, check
+            // again every 10 ms so that a new half-period is picked up.
+            let interval = if half_period > 0 { half_period } else { 10_000 };
+            let next = timer.timerawl().read().bits().wrapping_add(interval);
+            timer.alarm0().write(|w| unsafe { w.bits(next) });
         }
     });
 }
@@ -371,7 +343,6 @@ fn main() -> ! {
 
 <InArticleAd />
 
-
 ### Project Structure
 
 <FileTree>
@@ -417,7 +388,7 @@ opt-level = "s"
 overflow-checks = false
 ```
 
-Use the same `memory.x`, `build.rs`, `.cargo/config.toml`, and `Embed.toml` from Lesson 1.
+Use the same `memory.x`, `build.rs`, `.cargo/config.toml`, and `Embed.toml` as in [the first blink project](/education/embedded-rust-rp2040/rust-toolchain-first-blink/).
 
 ### src/main.rs
 
@@ -449,7 +420,6 @@ use rp_pico::hal::pac::interrupt;
 use rp_pico::hal::Clock;
 
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
-use embedded_hal::delay::DelayNs;
 use embedded_hal::pwm::SetDutyCycle;
 use embedded_hal_0_2::adc::OneShot;
 
@@ -483,7 +453,7 @@ static BUZZER_PIN: Mutex<RefCell<Option<BuzzerPin>>> =
 #[interrupt]
 fn TIMER_IRQ_0() {
     critical_section::with(|cs| {
-        let mut timer_ref = TIMER_PERIPH.borrow_ref_mut(cs);
+        let timer_ref = TIMER_PERIPH.borrow_ref(cs);
         let half_period = *BUZZER_HALF_PERIOD_US.borrow_ref(cs);
 
         if let Some(ref timer) = *timer_ref {
@@ -500,12 +470,15 @@ fn TIMER_IRQ_0() {
                         let _ = pin.set_high();
                     }
                 }
-
-                // Schedule the next alarm
-                let now = timer.timerawl().read().bits();
-                let next = now.wrapping_add(half_period);
-                timer.alarm0().write(|w| unsafe { w.bits(next) });
             }
+
+            // Schedule the next alarm. An alarm fires only once, so it
+            // must always be re-armed. While the buzzer is off, check
+            // again every 10 ms so that a new half-period is picked up.
+            let interval = if half_period > 0 { half_period } else { 10_000 };
+            let now = timer.timerawl().read().bits();
+            let next = now.wrapping_add(interval);
+            timer.alarm0().write(|w| unsafe { w.bits(next) });
         }
     });
 }
@@ -521,7 +494,7 @@ fn adc_to_angle(adc_val: u16) -> u16 {
 
 /// Map a servo angle (0-180) to a PWM compare value for the servo.
 /// Servo expects 0.5 ms to 2.5 ms pulse in a 20 ms period.
-/// With PSC such that counter runs at 1 MHz and wrap = 19999:
+/// With the divider set so that the counter runs at 1 MHz and wrap = 19999:
 ///   0 degrees   -> 500  (0.5 ms)
 ///   90 degrees  -> 1500 (1.5 ms)
 ///   180 degrees -> 2500 (2.5 ms)
@@ -626,6 +599,12 @@ fn main() -> ! {
 
     // Enable alarm 0 interrupt in the TIMER peripheral
     // We need to configure this before moving the peripheral
+
+    // Bring the TIMER peripheral out of reset first. hal::Timer::new()
+    // normally does this, but here we use the PAC directly.
+    pac.RESETS.reset().modify(|_, w| w.timer().clear_bit());
+    while pac.RESETS.reset_done().read().timer().bit_is_clear() {}
+
     let timer = pac.TIMER;
     timer.inte().modify(|_, w| w.alarm_0().set_bit());
 
@@ -708,32 +687,31 @@ INFO  ADC configured on GP26
 INFO  Timer alarm 0 interrupt enabled for buzzer
 INFO  Entering main loop. Turn the potentiometer.
 INFO  ADC: 2048 | Angle: 90 deg | Servo duty: 1500 | Buzzer half-period: 454 us
-INFO  ADC: 3000 | Angle: 131 deg | Servo duty: 1955 | Buzzer half-period: 345 us
+INFO  ADC: 3000 | Angle: 131 deg | Servo duty: 1955 | Buzzer half-period: 331 us
 INFO  ADC: 4095 | Angle: 180 deg | Servo duty: 2500 | Buzzer half-period: 250 us
 ```
 
 ### Testing Checklist
 
 <Steps>
-1. Turn the potentiometer fully counterclockwise. The servo should move to 0 degrees and the buzzer should be silent (or play a very low 200 Hz tone).
+1. Turn the potentiometer fully counterclockwise. The servo moves to 0 degrees and the buzzer is silent.
 
-2. Slowly turn the potentiometer clockwise. The servo should smoothly track the knob position. The buzzer pitch should rise as the angle increases.
+2. Turn the potentiometer slowly clockwise. The servo follows the knob, and the pitch rises.
 
-3. Turn fully clockwise. The servo should reach 180 degrees and the buzzer should play a high 2000 Hz tone.
+3. Turn fully clockwise. The servo reaches 180 degrees and the buzzer plays 2000 Hz.
 
-4. Move the potentiometer quickly back and forth. The servo should follow without significant lag. The buzzer tone should track the angle.
+4. Move the potentiometer quickly back and forth. The servo and the tone follow with no clear delay.
 
-5. Check the RTT output. Angle values should range from 0 to 180 and duty values from 500 to 2500.
+5. Read the log. The angle goes from 0 to 180 and the duty value from 500 to 2500.
 
-6. If the servo jitters at rest, try adding a 10 uF capacitor across the servo power pins. Noise on the 5V line causes jitter.
+6. If the servo trembles at rest, add a 10 uF capacitor across the servo power pins. Noise on the 5V line causes this.
 </Steps>
 
 ## Timer Architecture on the RP2040
 
 <InArticleAd />
 
-
-The RP2040 has a single 64-bit microsecond timer with 4 alarm registers. Each alarm can trigger an interrupt when the lower 32 bits of the timer match the alarm value. This is different from STM32, which has multiple independent timer peripherals with prescalers and auto-reload registers.
+The RP2040 has one 64-bit timer that counts microseconds, with 4 alarm registers. An alarm causes an interrupt when the lower 32 bits of the timer equal the alarm value. It fires once, so the handler must set the next alarm itself. An STM32 is different: it has several separate timers, each with a prescaler and an auto-reload register.
 
 | Feature | RP2040 Timer | STM32 General-Purpose Timer |
 |---------|-------------|---------------------------|
@@ -745,14 +723,11 @@ The RP2040 has a single 64-bit microsecond timer with 4 alarm registers. Each al
 
 ### Why We Use Both Timer and PWM
 
-On the RP2040, the timer peripheral and the PWM peripheral are separate. The timer is a microsecond counter with alarms. The PWM hardware has its own counters with dividers and wrap values. For servo PWM, we use the PWM hardware because it generates the signal in hardware with no CPU involvement. For the buzzer, we use a timer alarm interrupt to toggle a GPIO, because the buzzer frequency changes dynamically and we want to demonstrate interrupt handling.
-
-An alternative approach would be to reconfigure the buzzer's PWM slice wrap value and divider on every angle change. Both approaches are valid. The interrupt approach teaches a more general pattern you will need in later lessons.
+On the RP2040 the timer and the PWM hardware are separate. The servo uses the PWM hardware, because the pulse is then made with no CPU time and no timing error. The buzzer uses a timer alarm interrupt that switches a GPIO pin. A second PWM slice at 50% duty, with a new wrap value for each pitch, would also make the tone, with no CPU time at all. The interrupt is used here because the way it shares data is needed in most real projects.
 
 ## Interrupt Safety Deep Dive
 
 <InArticleAd />
-
 
 ### Why `unsafe` for NVIC::unmask?
 
@@ -762,23 +737,21 @@ unsafe {
 }
 ```
 
-Enabling an interrupt is `unsafe` because it causes code to run asynchronously. The Rust compiler cannot verify that your interrupt handler and your main code do not have data races unless you use the Mutex/critical-section pattern. By marking `NVIC::unmask` as unsafe, Rust forces you to acknowledge that you are enabling asynchronous execution and that you have handled synchronization correctly.
+`unsafe` marks an operation where the compiler cannot check the rules, and you promise that you have checked them. The NVIC is the interrupt controller of the ARM core, and `unmask` switches one interrupt on. From that line on, the handler can run in the middle of any other code, and it could break a critical section that relies on this interrupt being off. The compiler cannot see whether your shared data is ready for that, so it asks you to say so. The `unsafe` block is small on purpose: it shows a reviewer the one line to examine.
 
 ### The `Option` Pattern for Moving Peripherals into ISRs
 
-Interrupt handlers in Rust are free functions (not closures), so they cannot capture variables from the enclosing scope. The only way to give them access to peripherals is through statics. But statics must be initialized at compile time, and peripherals are only available at runtime (after `Peripherals::take()`).
-
-The solution is `Mutex<RefCell<Option<T>>>`:
+A `static` must have its value when the program is built, but a peripheral exists only at run time, after `Peripherals::take()`. `Mutex<RefCell<Option<T>>>` joins the two:
 
 1. The static starts as `None`.
-2. In `main()`, after configuring the peripheral, you move it into the static with `.replace(peripheral)`.
-3. In the ISR, you borrow the static and match on `Some(ref peripheral)` to access it.
+2. In `main()`, after you configure the peripheral, you move it into the static with `.replace(peripheral)`.
+3. In the ISR, you borrow the static and test for `Some(ref peripheral)`.
 
-This is more verbose than C's approach of directly accessing peripheral registers, but it provides guarantees that C cannot: the compiler verifies that the peripheral is accessed through a critical section, and the type system prevents accessing it before initialization (the `if let Some(...)` pattern).
+This is longer than the C code, which writes to the registers directly. In return, a handler that touches the peripheral outside a critical section, or before it is set up, does not compile.
 
 ### Atomic Operations as an Alternative
 
-For simple shared values like the buzzer half-period (a single `u32`), you can use `core::sync::atomic::AtomicU32` instead of `Mutex<RefCell<u32>>`. Atomics do not require disabling interrupts:
+For one simple value such as the buzzer half-period (a single `u32`), `core::sync::atomic::AtomicU32` can replace `Mutex<RefCell<u32>>`. An atomic type is read or written in one step that cannot be interrupted, so interrupts stay on:
 
 ```rust
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -792,34 +765,30 @@ BUZZER_HALF_PERIOD_ATOMIC.store(half_period, Ordering::Relaxed);
 let hp = BUZZER_HALF_PERIOD_ATOMIC.load(Ordering::Relaxed);
 ```
 
-This is lighter weight but only works for single values that can be updated atomically. For multiple related values that must be consistent (like a struct with both frequency and duration), use the Mutex pattern.
+This costs less, but it works only for one value. For several values that must agree (a frequency and a duration), use the Mutex pattern.
 
 :::tip[Instrument it]
-Timers and interrupts are not just for driving a servo, they are how you measure time-based signals precisely. Capture the interval between pulses from a Hall sensor and you have a tachometer reading RPM; trigger an ADC read on a timer and you sample a sensor at an exact, jitter-free rate, which is what clean vibration or current data depends on. Do the timing in hardware, and a Pico can [report accurate rates and waveforms](/education/iot-systems/) to [siliconwit.io](https://siliconwit.io) rather than smeared ones.
+The same timer measures signals. The time between two pulses of a Hall sensor gives the speed of a shaft in RPM. An ADC reading started by a timer samples a sensor at an exact rate, which vibration and current measurements need. With the timing done in hardware, a Pico can [report true rates and waveforms](/education/iot-systems/) to [siliconwit.io](https://siliconwit.io).
 :::
 
 ## Production Notes
 
 <InArticleAd />
 
-
 <Card title="Production Considerations" icon="setting">
 
-**Servo signal quality:** The RP2040's PWM hardware generates jitter-free servo signals because the counter runs in hardware. The only source of jitter is updating the duty cycle register, which the hardware double-buffers. In production, this is more reliable than software-generated PWM.
+**Servo signal quality:** The counter runs in hardware, so the servo pulse has no timing error from the program. A new compare value is held in a buffer and takes effect at the start of the next period, so no pulse is cut short.
 
-**ADC noise:** The RP2040's ADC is noisy, especially when USB is active. For production, average multiple readings, add a 100 nF capacitor between the ADC input and ground, and consider using the ADC's round-robin mode with DMA (covered in Lesson 5).
+**ADC noise:** The ADC of the RP2040 is noisy, more so when USB is active. Average several readings and add a 100 nF capacitor between the ADC input and ground. For fast sampling, let DMA collect the readings (DMA is shown with the UART later in the course).
 
-**Interrupt latency:** The critical section in the ISR disables interrupts for the duration of the closure. Keep the closure short. In this project, the ISR toggles one pin and re-arms one alarm, which takes only a few microseconds. For time-critical applications, consider using atomics instead of critical sections.
+**Interrupt latency:** Interrupts are off while the closure of a critical section runs, so keep it short. Here the ISR switches one pin and sets one alarm, which takes a few microseconds. Where even that is too long, use atomics.
 
-**Buzzer alternative:** Instead of toggling a GPIO in a timer ISR, you could use a second PWM slice with its duty cycle set to 50% and change its frequency by adjusting the wrap value. This would be fully hardware-driven with zero CPU overhead. The ISR approach used here is pedagogical; it teaches the interrupt pattern that you will need for more complex scenarios.
-
-**Power management:** The SG90 servo draws significant current during movement. If your application is battery-powered, consider using a servo with lower idle current, or switching the servo power supply off when the servo is not moving (using a MOSFET controlled by a GPIO pin).
+**Power management:** The SG90 draws a high current while it moves. On a battery, switch the servo supply off with a MOSFET on a GPIO pin when the servo is at rest.
 </Card>
 
 ## What You Have Learned
 
 <InArticleAd />
-
 
 <Card title="Lesson 3 Complete" icon="approve-check">
 
@@ -848,12 +817,10 @@ Timers and interrupts are not just for driving a servo, they are how you measure
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 4: I2C, SPI, and embedded-hal Drivers](/education/embedded-rust-rp2040/i2c-spi-embedded-hal), you will use embedded-hal traits to interface a BME280 temperature/humidity/pressure sensor over I2C and an SSD1306 OLED display over I2C. You will see how trait-based drivers work across any microcontroller, not just the RP2040.
+The next lesson is [Embassy Async Fundamentals](/education/embedded-rust-rp2040/embassy-async-fundamentals/), where tasks that wait replace most hand-written interrupt handlers. After it, [I2C and SPI with embedded-hal](/education/embedded-rust-rp2040/i2c-spi-embedded-hal/) reads a BME280 sensor and drives an OLED display with drivers that work on any microcontroller.
 :::
 
 <EmbeddedRustRp2040Comments />
-
-
 
 <InArticleAd />
 <TawkWidget />

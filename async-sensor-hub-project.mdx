@@ -21,16 +21,14 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
   contributors={frontmatter.contributors}
 />
 
-
-
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-Individual peripherals are straightforward in isolation. The real challenge appears when you need a sensor reading every 100 ms, an OLED refresh every 500 ms, an SD card write every second, and an MQTT publish every two seconds, all without any task starving the others or corrupting shared data. In C with FreeRTOS, you would manage six threads, six stacks, and a web of mutexes. Embassy collapses this into six async tasks sharing a single stack, with zero-copy channels replacing mutexes and the compiler enforcing that no two tasks can alias the same buffer. In this capstone you will build exactly that system on the Pico W: BME280 readings flowing through channels to a display, an SD logger, an MQTT publisher, button handlers, and status LEDs, all running concurrently with no shared mutable globals. #AsyncEmbedded #SensorHub #Capstone
+One sensor, one display or one network link is easy to program alone. The trouble starts when a device needs all of them together: a reading every 100 ms, a display update every 500 ms, a line on an SD card every second and a network message every two seconds. Then a slow card write freezes the display, a dead network stops the logging, and two parts of the program change the same variable. In C with FreeRTOS the answer is six tasks, six stacks and a mutex around every shared variable. In this last project you build the system on the Pico W as six Embassy tasks on one stack. Each task owns its hardware, and data moves between tasks only through a `Watch` and two `Signal`s, so the program has no variable that two tasks can write. #AsyncEmbedded #SensorHub #Capstone
 
 ## What We Are Building
 
 <Card title="Async Sensor Hub" icon="star">
-A Pico W running six concurrent Embassy tasks: sensor reading (BME280 over I2C at 100 ms), display update (SSD1306 OLED over I2C at 500 ms), SD card logging (SPI at 1 s), MQTT publishing (Wi-Fi at 2 s), button handling (two buttons for mode switching and manual publish), and status LED feedback. Data flows between tasks through Embassy channels and signals with no shared mutable state.
+A Pico W that runs six Embassy tasks: a sensor task (BME280 over I2C, every 100 ms), a display task (SSD1306 OLED over I2C, every 500 ms), an SD card logger (SPI, every second), an MQTT publisher (Wi-Fi, every 2 seconds), a button task (two buttons: display mode and publish now) and a status LED task. Two more tasks in the background run the radio and the network stack.
 </Card>
 
 **System specifications:**
@@ -45,7 +43,7 @@ A Pico W running six concurrent Embassy tasks: sensor reading (BME280 over I2C a
 | Input | 2 push buttons (mode select, manual publish) |
 | Output | 2 LEDs (Wi-Fi status, SD card activity) |
 | Tasks | 6 concurrent async tasks |
-| Data Flow | Embassy channels (zero-copy, bounded) |
+| Data Flow | Embassy `Watch` and `Signal` (latest value, no queue) |
 
 ### Bill of Materials
 
@@ -66,78 +64,79 @@ A Pico W running six concurrent Embassy tasks: sensor reading (BME280 over I2C a
 
 <InArticleAd />
 
+The design follows two rules, and the rest of the lesson is their consequence:
 
-The sensor hub is organized as a set of independent async tasks that communicate through Embassy channels. Each task owns its peripherals exclusively. No task shares a mutable reference with any other task. This eliminates data races at compile time.
+- One owner for each piece of hardware. A bus, a pin or a socket belongs to exactly one task, and the compiler rejects a program that gives it to two.
+- Tasks pass copies of data, never shared variables. One task writes a value into a `static` channel, and the others read a copy from it.
 
-```text
-  Pico W Sensor Hub Wiring
-  ──────────────────────────────────────────
-  GP4 (SDA0) ──── BME280 SDA     (I2C0 sensor)
-  GP5 (SCL0) ──── BME280 SCL
-
-  GP6 (SDA1) ──── SSD1306 SDA    (I2C1 display)
-  GP7 (SCL1) ──── SSD1306 SCL
-
-  GP10 (SCK)  ──── SD Card CLK   (SPI1 storage)
-  GP11 (MOSI) ──── SD Card MOSI
-  GP12 (MISO) ──── SD Card MISO
-  GP13 (CS)   ──── SD Card CS
-
-  GP16 ──330R──── Green LED      (Wi-Fi status)
-  GP17 ──330R──── Yellow LED     (SD activity)
-
-  GP18 ──── Button A (to GND)    (display mode)
-  GP19 ──── Button B (to GND)    (manual publish)
-
-  3V3 ──── All component VCC
-  GND ──── All component GND
-```
+A data race needs two writers of one thing. With these two rules no such thing exists.
 
 ### Task Overview
 
 | Task | Interval | Peripherals Owned | Role |
 |------|----------|-------------------|------|
-| Sensor Read | 100 ms | I2C0 (BME280) | Reads BME280, sends data to channel |
-| Display Update | 500 ms | I2C1 (SSD1306) | Receives data, renders to OLED |
-| SD Card Log | 1 s | SPI0 (SD card) | Receives data, writes CSV to file |
-| MQTT Publish | 2 s | TCP socket (Wi-Fi) | Receives data, publishes JSON |
-| Button Handler | Edge-triggered | GP18, GP19 (buttons) | Sends commands via signal |
-| LED Status | 100 ms | GP16, GP17 (LEDs) | Reads system state, drives LEDs |
+| Sensor Read | 100 ms | I2C0 (BME280) | Reads the BME280, writes the reading to the `Watch` |
+| Display Update | 500 ms | I2C1 (SSD1306) | Reads the newest value, draws it on the OLED |
+| SD Card Log | 1 s | SPI1 (SD card), GP17 (LED) | Reads the newest value, adds a CSV line to a file |
+| MQTT Publish | 2 s | TCP socket (Wi-Fi) | Reads the newest value, publishes JSON |
+| Button Handler | On a press | GP18, GP19 (buttons) | Sends a signal for each press |
+| LED Status | 250 ms | GP16 (LED) | Reads the system state, drives the status LED |
+
+The drawing shows the first second. Each task runs for a short time and then waits at an `.await`, and only one task runs at any moment.
+
+```text
+ time (ms)  0       200     400     600     800     1000
+            |       |       |       |       |       |
+ sensor     █...█...█...█...█...█...█...█...█...█...█
+ display    █...................█...................█
+ SD card    █.......................................█
+ MQTT       █........................................
+ LED        █.........█.........█.........█.........█
+
+ █  the task runs, then waits at its next .await
+ .  the task waits and uses no processor time
+```
+
+The marks are not all equally short. A sensor read is spread over several short runs, with an `.await` between them. The display and the SD card use drivers that do not await, so the display task holds the processor for about 23 ms each time it draws, and a sensor reading that is due in that time is late. The part Production Notes returns to this.
 
 ### Data Flow
 
-The BME280 sensor task produces readings at 100 ms intervals and writes them into a bounded channel with capacity 4. The display, SD card, and MQTT tasks each read from this channel at their own pace. Since the channel has a capacity of 4, the sensor task never blocks unless all three consumers are stalled. If the channel is full, the oldest reading is overwritten (using a "watch" channel pattern) so the consumers always see the latest data.
+The sensor task makes ten readings a second, and the MQTT task wants one every two seconds. If every reading waited in a queue, the queue would fill and the published values would be old. A `Watch` solves this. It holds one value. Each new reading replaces the one before, so the sensor task never waits for a reader. The display, SD card and MQTT tasks each have a receiver of their own and read the newest value when they are ready for it.
 
-The button handler task sends commands through a separate signal channel. When button A is pressed, it cycles through display modes (temperature, humidity, pressure, all). When button B is pressed, it triggers an immediate MQTT publish regardless of the 2-second timer.
+A `Channel` is the other tool, and it is a queue: `send` waits when the queue is full, and each message goes to only one receiver. Use it when no message may be lost. For a measurement, only the newest reading matters.
 
+```text
+            ┌──────────────┐
+            │ Sensor task  │
+            │ (100 ms)     │
+            └──────┬───────┘
+                   │ SensorData
+                   ▼
+        ┌─────────────────────┐
+        │ Watch SENSOR_DATA   │
+        │ (newest reading)    │
+        └───┬───────┬───────┬─┘
+            ▼       ▼       ▼
+     ┌─────────┐┌─────────┐┌─────────┐
+     │ Display ││ SD card ││  MQTT   │
+     │ 500 ms  ││  1 s    ││  2 s    │
+     └─────────┘└─────────┘└─────────┘
 ```
-                 ┌──────────────┐
-                 │  BME280 Read │
-                 │  (100 ms)    │
-                 └──────┬───────┘
-                        │ SensorData
-                        ▼
-              ┌─────────────────────┐
-              │  Watch Channel      │
-              │  (latest reading)   │
-              └───┬────┬────┬───────┘
-                  │    │    │
-          ┌───────┘    │    └───────┐
-          ▼            ▼            ▼
-   ┌──────────┐ ┌──────────┐ ┌──────────┐
-   │  Display │ │  SD Card │ │   MQTT   │
-   │ (500 ms) │ │  (1 s)   │ │  (2 s)   │
-   └──────────┘ └──────────┘ └──────────┘
 
-   ┌──────────┐              ┌──────────┐
-   │ Buttons  │──Signal──────│ LED Task │
-   └──────────┘              └──────────┘
+The button task sends each press through a `Signal`, which carries "it happened" and no data. Button A tells the display task to show the next mode (temperature, humidity, pressure, all). Button B tells the MQTT task to publish now and not wait for the rest of its 2 seconds.
+
+```text
+ ┌──────────┐ BUTTON_A_SIGNAL ┌──────────┐
+ │          ├────────────────>│ Display  │
+ │  Button  │                 └──────────┘
+ │  task    │ BUTTON_B_SIGNAL ┌──────────┐
+ │          ├────────────────>│  MQTT    │
+ └──────────┘                 └──────────┘
 ```
 
 ## Circuit Connections
 
 <InArticleAd />
-
 
 ### Complete Wiring Table
 
@@ -158,16 +157,15 @@ The button handler task sends commands through a separate signal channel. When b
 | 3V3 | BME280 VIN, SSD1306 VCC, SD VCC | Power |
 | GND | All grounds | Common ground |
 
-Both buttons connect between the GPIO pin and GND. Internal pull-up resistors are enabled in software. The BME280 and SSD1306 share the same 3.3V rail but use separate I2C buses (I2C0 and I2C1) to avoid address conflicts and allow independent access from different tasks.
+Each button connects its GPIO pin to GND, and the code turns on the internal pull-up resistors. The BME280 and the SSD1306 share the 3.3 V supply but use separate I2C buses (I2C0 and I2C1).
 
 ### Why Two I2C Buses?
 
-The BME280 (address 0x76) and SSD1306 (address 0x3C) have different I2C addresses, so they could technically share one bus. However, putting them on separate buses lets us give each task exclusive ownership of its I2C peripheral. The sensor task owns I2C0 and the display task owns I2C1. Neither task needs to coordinate access. If they shared one bus, we would need a mutex, which adds complexity and potential deadlocks. The RP2040 has two I2C peripherals, so we use both.
+The BME280 (address 0x76) and the SSD1306 (address 0x3C) have different addresses, so one bus could carry both. Two buses are used for the sake of ownership. The sensor task owns I2C0 and the display task owns I2C1, and neither waits for the other. On one shared bus the two tasks would need a mutex around every transfer, and a display update of 23 ms would delay the sensor. The RP2040 has two I2C blocks, so the design uses both.
 
 ## Project Setup
 
 <InArticleAd />
-
 
 ### Cargo.toml
 
@@ -178,21 +176,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
-embassy-net = { version = "0.6", features = ["tcp", "dhcpv4", "medium-ethernet"] }
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-32768"] }
+embassy-rp = { version = "0.3", features = ["time-driver", "critical-section-impl", "rp2040"] }
+embassy-net = { version = "0.6", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet"] }
 embassy-time = { version = "0.4" }
 embassy-futures = { version = "0.1" }
 embassy-sync = { version = "0.6" }
 
-cyw43 = { version = "0.4" }
-cyw43-pio = { version = "0.4", features = ["overclock"] }
-cyw43-firmware = { version = "0.4" }
+cyw43 = { version = "0.3" }
+cyw43-pio = { version = "0.3" }
+cyw43-firmware = { version = "0.1", features = ["wifi"] }
 
 embedded-sdmmc = { version = "0.8" }
+embedded-hal-bus = { version = "0.2" }
 ssd1306 = { version = "0.9" }
 embedded-graphics = { version = "0.8" }
 embedded-hal-async = { version = "1" }
+embedded-io-async = { version = "0.6" }
+rand_core = { version = "0.6" }
 
 defmt = "0.3"
 defmt-rtt = "0.4"
@@ -229,6 +230,7 @@ opt-level = "s"
 fn main() {
     println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
+    println!("cargo:rustc-link-arg-bins=-Tlink-rp.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 }
 ```
@@ -260,8 +262,7 @@ DEFMT_LOG = "debug"
 
 <InArticleAd />
 
-
-Before writing the tasks, we define the data structures that flow between them. These types are the contract between producers and consumers.
+The types below are what the tasks pass to each other. A task that writes and a task that reads agree only on these types, and on nothing else.
 
 ```rust title="Data types (in main.rs)"
 /// Sensor reading from the BME280.
@@ -318,10 +319,12 @@ struct SystemStatus {
 
 ### Embassy Channels and Signals
 
-Embassy provides two main inter-task communication primitives:
+This project uses two tools from `embassy_sync`:
 
-- **`Watch`**: A single-value channel where the writer overwrites the current value and all readers see the latest value. Perfect for sensor data where only the most recent reading matters.
-- **`Signal`**: A one-shot notification that wakes a waiting task. Perfect for button events and status updates.
+- A `Watch` holds one value. The writer replaces it, and every reader gets the newest value. It carries the sensor data and the system status.
+- A `Signal` wakes one waiting task. It carries the button presses.
+
+Both are `static`, so they exist for the whole run and every task can reach them by name.
 
 ```rust
 use embassy_sync::watch::Watch;
@@ -329,7 +332,7 @@ use embassy_sync::signal::Signal;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 // Watch channel for sensor data: writer overwrites, readers get latest
-static SENSOR_DATA: Watch<CriticalSectionRawMutex, SensorData, 2> = Watch::new();
+static SENSOR_DATA: Watch<CriticalSectionRawMutex, SensorData, 3> = Watch::new();
 
 // Signal for button commands
 static BUTTON_A_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -339,14 +342,15 @@ static BUTTON_B_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static SYSTEM_STATUS: Watch<CriticalSectionRawMutex, SystemStatus, 2> = Watch::new();
 ```
 
-The `Watch` channel with capacity 2 means two receivers can independently track the latest value. Each receiver has its own "seen" flag, so they do not interfere with each other. The `Signal` is a one-shot notification: calling `signal(())` wakes any task waiting on `wait()`. If no task is waiting, the signal is stored and delivered on the next `wait()` call.
+The last parameter of `Watch` is the largest number of receivers. `SENSOR_DATA` needs three (display, SD card and MQTT), and a fourth call to `receiver()` returns `None`. `SYSTEM_STATUS` allows two, and the LED task uses one. Each receiver remembers by itself which value it has seen, so one reader does not disturb another.
+
+`signal(())` wakes the task that waits in `wait()`. If no task waits at that moment, the signal is kept and the next `wait()` returns at once. Two presses before the reader looks count as one.
 
 ## Complete Firmware
 
 <InArticleAd />
 
-
-Here is the complete `main.rs` with all six tasks. Each section is annotated with its purpose and how it interacts with the other tasks.
+The complete `main.rs` follows. Read it one task at a time, and in each task look for two things: what the task owns (its parameters), and where it awaits.
 
 ```rust title="src/main.rs"
 #![no_std]
@@ -360,9 +364,9 @@ use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{Async, I2c, Config as I2cConfig, InterruptHandler as I2cIrq};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, I2C1, PIO0, SPI1};
+use embassy_rp::peripherals::{DMA_CH0, I2C0, I2C1, PIO0, SPI1};
 use embassy_rp::pio::{InterruptHandler as PioIrq, Pio};
-use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
+use embassy_rp::spi::{Blocking, Config as SpiConfig, Phase, Polarity, Spi};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config as NetConfig, StackResources};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -370,7 +374,11 @@ use embassy_sync::signal::Signal;
 use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Timer};
 
-use cyw43_pio::PioSpi;
+use cyw43::JoinOptions;
+use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
+use embedded_hal_async::i2c::I2c as _; // async write() and write_read()
+use embedded_io_async::{Read, Write}; // read_exact() and write_all()
+use rand_core::RngCore;
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
@@ -449,7 +457,7 @@ impl Default for SystemStatus {
 
 // ── Inter-Task Communication ───────────────────────────────────────
 
-static SENSOR_DATA: Watch<CriticalSectionRawMutex, SensorData, 2> = Watch::new();
+static SENSOR_DATA: Watch<CriticalSectionRawMutex, SensorData, 3> = Watch::new();
 static SYSTEM_STATUS: Watch<CriticalSectionRawMutex, SystemStatus, 2> = Watch::new();
 static BUTTON_A_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static BUTTON_B_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -475,16 +483,15 @@ async fn sensor_task(mut i2c: I2c<'static, I2C0, Async>) {
     let cal = match bme280_init(&mut i2c).await {
         Ok(c) => {
             info!("BME280 initialized successfully");
-            let sender = SYSTEM_STATUS.sender();
-            sender.send(SystemStatus {
-                sensor_ok: true,
-                ..SystemStatus::default()
+            // Set one flag and keep the others as they are
+            SYSTEM_STATUS.sender().send_modify(|s| {
+                if let Some(s) = s { s.sensor_ok = true; }
             });
             c
         }
         Err(_) => {
             error!("BME280 initialization failed");
-            // Signal sensor failure and halt this task
+            // Halt this task; the other tasks keep running
             loop { Timer::after(Duration::from_secs(60)).await; }
         }
     };
@@ -521,7 +528,6 @@ async fn display_task(i2c: I2c<'static, I2C1, Async>) {
 
     // Initialize SSD1306 OLED
     use ssd1306::prelude::*;
-    use ssd1306::mode::BufferedGraphicsMode;
     use ssd1306::I2CDisplayInterface;
     use ssd1306::Ssd1306;
     use ssd1306::size::DisplaySize128x64;
@@ -652,15 +658,18 @@ async fn display_task(i2c: I2c<'static, I2C1, Async>) {
 
 #[embassy_executor::task]
 async fn sd_card_task(
-    spi: Spi<'static, SPI1, Async>,
+    spi: Spi<'static, SPI1, Blocking>,
     cs: Output<'static>,
     mut activity_led: Output<'static>,
 ) {
     info!("SD card task started");
 
+    use embedded_hal_bus::spi::ExclusiveDevice;
     use embedded_sdmmc::{SdCard, VolumeManager, Mode, VolumeIdx};
 
-    let sd_card = SdCard::new(spi, cs, embassy_time::Delay);
+    // embedded-sdmmc is a blocking driver that needs an SpiDevice (bus + chip select)
+    let spi_dev = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
+    let sd_card = SdCard::new(spi_dev, embassy_time::Delay);
 
     // Wait for card to be ready
     Timer::after(Duration::from_millis(500)).await;
@@ -668,6 +677,8 @@ async fn sd_card_task(
     let mut volume_mgr = match sd_card.num_bytes() {
         Ok(size) => {
             info!("SD card detected: {} bytes", size);
+            // The card is initialized; raise the SPI clock so writes are short
+            sd_card.spi(|dev| dev.bus_mut().set_frequency(16_000_000));
             VolumeManager::new(sd_card, DummyTimesource)
         }
         Err(_) => {
@@ -677,7 +688,7 @@ async fn sd_card_task(
     };
 
     // Open volume and root directory
-    let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
+    let volume = match volume_mgr.open_raw_volume(VolumeIdx(0)) {
         Ok(v) => v,
         Err(_) => {
             warn!("Failed to open SD card volume");
@@ -799,13 +810,6 @@ async fn mqtt_task(stack: embassy_net::Stack<'static>) {
 
         // Publish loop
         loop {
-            // Check for manual publish trigger from button B
-            let manual_trigger = BUTTON_B_SIGNAL.signaled();
-            if manual_trigger {
-                BUTTON_B_SIGNAL.reset();
-                info!("MQTT: manual publish triggered");
-            }
-
             let data = receiver.get().await;
 
             let json_len = format_json(
@@ -823,7 +827,7 @@ async fn mqtt_task(stack: embassy_net::Stack<'static>) {
             }
 
             info!(
-                "MQTT: published seq={} T={}.{} H={}.{} P={}",
+                "MQTT: published seq={} T={}.{:02} H={}.{:02} P={}",
                 data.sequence,
                 data.temperature_c / 100,
                 (data.temperature_c % 100).unsigned_abs(),
@@ -843,8 +847,13 @@ async fn mqtt_task(stack: embassy_net::Stack<'static>) {
                 }
             }
 
-            if !manual_trigger {
-                Timer::after(Duration::from_secs(2)).await;
+            // Wait 2 seconds, or stop waiting at once when button B is pressed
+            let wait = embassy_futures::select::select(
+                Timer::after(Duration::from_secs(2)),
+                BUTTON_B_SIGNAL.wait(),
+            ).await;
+            if let embassy_futures::select::Either::Second(_) = wait {
+                info!("MQTT: manual publish triggered");
             }
         }
 
@@ -854,12 +863,9 @@ async fn mqtt_task(stack: embassy_net::Stack<'static>) {
 }
 
 fn update_mqtt_status(connected: bool) {
-    let sender = SYSTEM_STATUS.sender();
-    sender.send(SystemStatus {
-        wifi_connected: true,
-        mqtt_connected: connected,
-        sd_card_ok: true,
-        sensor_ok: true,
+    // Change one flag and keep the others as they are
+    SYSTEM_STATUS.sender().send_modify(|s| {
+        if let Some(s) = s { s.mqtt_connected = connected; }
     });
 }
 
@@ -945,8 +951,8 @@ async fn main(spawner: Spawner) {
 
     // ── CYW43 Wi-Fi Initialization ─────────────────────────────────
 
-    let fw = cyw43_firmware::firmware();
-    let clm = cyw43_firmware::clm();
+    let fw = cyw43_firmware::CYW43_43439A0;
+    let clm = cyw43_firmware::CYW43_43439A0_CLM;
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -955,6 +961,7 @@ async fn main(spawner: Spawner) {
     let spi_wifi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
+        DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
@@ -970,7 +977,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(cyw43_task(cyw43_runner)).unwrap();
 
     control.init(clm).await;
-    control.set_power_management(cyw43::PowerManagement::PowerSave).await;
+    control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
 
     // ── Network Stack ──────────────────────────────────────────────
 
@@ -979,8 +986,11 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
+    // Random seed for the stack (TCP sequence numbers, local ports)
+    let seed = embassy_rp::clocks::RoscRng.next_u64();
+
     let (stack, net_runner) = embassy_net::new(
-        net_device, net_config, resources, embassy_rp::clocks::RoscRng,
+        net_device, net_config, resources, seed,
     );
     spawner.spawn(net_task(net_runner)).unwrap();
 
@@ -988,7 +998,7 @@ async fn main(spawner: Spawner) {
 
     info!("Connecting to Wi-Fi: {}", WIFI_SSID);
     loop {
-        match control.join_wpa2(WIFI_SSID, WIFI_PASS).await {
+        match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASS.as_bytes())).await {
             Ok(_) => {
                 info!("Wi-Fi connected");
                 break;
@@ -1031,19 +1041,18 @@ async fn main(spawner: Spawner) {
     // I2C0 for BME280 sensor
     let i2c0 = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, I2cConfig::default());
 
-    // I2C1 for SSD1306 display
-    let i2c1 = I2c::new_async(p.I2C1, p.PIN_7, p.PIN_6, Irqs, I2cConfig::default());
+    // I2C1 for SSD1306 display (400 kHz keeps each frame transfer short)
+    let mut i2c1_config = I2cConfig::default();
+    i2c1_config.frequency = 400_000;
+    let i2c1 = I2c::new_async(p.I2C1, p.PIN_7, p.PIN_6, Irqs, i2c1_config);
 
-    // SPI1 for SD card
+    // SPI1 for SD card (blocking mode: embedded-sdmmc is a blocking driver)
     let mut spi_config = SpiConfig::default();
     spi_config.frequency = 400_000; // Start slow for SD init
     spi_config.phase = Phase::CaptureOnFirstTransition;
     spi_config.polarity = Polarity::IdleLow;
 
-    let spi_sd = Spi::new(
-        p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12,
-        p.DMA_CH1, p.DMA_CH2, spi_config,
-    );
+    let spi_sd = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi_config);
     let sd_cs = Output::new(p.PIN_13, Level::High);
 
     // GPIOs
@@ -1189,10 +1198,12 @@ async fn bme280_init(i2c: &mut I2c<'_, I2C0, Async>) -> Result<Bme280Calibration
         dig_h6: cal_h[6] as i8,
     };
 
-    // Configure sensor: humidity x1, temp x1, pressure x1, normal mode
+    // Configure sensor: standby 62.5 ms (a new result about every 70 ms, so each
+    // 100 ms read gets fresh data), humidity x1, temp x1, pressure x1, normal mode.
+    // Register 0xF5 is written first: in normal mode a write to it can be ignored.
+    i2c.write(BME280_ADDR, &[0xF5, 0x20]).await.map_err(|_| ())?;
     i2c.write(BME280_ADDR, &[0xF2, 0x01]).await.map_err(|_| ())?;
     i2c.write(BME280_ADDR, &[0xF4, 0x27]).await.map_err(|_| ())?;
-    i2c.write(BME280_ADDR, &[0xF5, 0xA0]).await.map_err(|_| ())?;
 
     Ok(cal)
 }
@@ -1233,7 +1244,7 @@ async fn bme280_read(
         p = (((p << 31) - var2_p) * 3125) / var1_p;
         let v1 = ((cal.dig_p9 as i64) * (p >> 13) * (p >> 13)) >> 25;
         let v2 = ((cal.dig_p8 as i64) * p) >> 19;
-        ((p + v1 + v2) >> 8) as u32 + (((cal.dig_p7 as i64) << 4) as u32)
+        (((p + v1 + v2) >> 8) + ((cal.dig_p7 as i64) << 4)) as u32
     };
 
     // Humidity compensation
@@ -1359,27 +1370,39 @@ impl embedded_sdmmc::TimeSource for DummyTimesource {
 
 <InArticleAd />
 
-
 ### Data Ownership Model
 
-Each task owns its peripherals exclusively. The sensor task owns I2C0 (BME280). The display task owns I2C1 (SSD1306). The SD card task owns SPI1 and the SD chip select pin. The button task owns the two GPIO input pins. The LED task owns the two GPIO output pins. No peripheral is shared between tasks.
+No peripheral belongs to two tasks. The parameters of each task function show what it owns:
 
-Data flows between tasks through Embassy's `Watch` channel. The sensor task calls `sender.send(data)` to publish the latest reading. The display, SD card, and MQTT tasks each create their own `receiver` and call `receiver.get().await` to get the latest data. The `Watch` channel guarantees that each receiver always sees the most recent value. If the sensor publishes 5 readings while the MQTT task is sleeping for 2 seconds, the MQTT task gets the 5th reading when it wakes up, skipping the intermediate ones.
+| Task | Owns |
+|------|------|
+| Sensor | I2C0 (BME280) |
+| Display | I2C1 (SSD1306) |
+| SD card | SPI1, the chip select pin, the yellow LED |
+| Button | The two input pins |
+| LED | The green LED |
 
-This is fundamentally different from a shared global variable. With a global, you would need a mutex to prevent torn reads (reading half of one update and half of the next). With the Watch channel, all reads are atomic and consistent. The Rust compiler enforces this: you cannot accidentally access the sensor data without going through the channel.
+The data goes through the `Watch`. The sensor task calls `sender.send(data)`, which does not wait. The display, SD card and MQTT tasks each call `receiver.get().await` and get a copy of the newest reading. While the MQTT task waits its 2 seconds, the sensor task writes about 20 readings. The MQTT task gets the last of them and never sees the other 19.
+
+Compare a global variable. A reading has four fields, and a task that copies it could be stopped after two fields while another task writes new ones: half old, half new (a torn read). So a global needs a mutex at every access, and nothing warns you when you forget one. The `Watch` copies the whole value in one protected step, and the only way to the data is through it.
 
 ### Error Isolation
 
-Each task handles its own errors independently. If the SD card is removed, the SD card task logs a warning and retries, but all other tasks continue running. If the MQTT broker goes down, the MQTT task enters its reconnection loop with exponential backoff, while the display and SD card tasks keep working normally. If the BME280 sensor fails, the sensor task logs an error and halts, but it sent a default `SensorData` to the channel, so the consumers do not crash.
+Each task handles its own errors, so a fault in one part does not stop the others:
 
-This error isolation is a natural consequence of the task-per-peripheral architecture. In a traditional global-state C program, an SD card error might corrupt a shared buffer, or an MQTT timeout might block the main loop and freeze the display. With isolated tasks and channels, errors are contained.
+- SD card removed: the SD card task logs a warning for each failed write. The other tasks continue.
+- Broker down: the MQTT task goes to its loop with exponential backoff. The display and the SD card logger continue, so the readings are still recorded on the device.
+- BME280 not found at startup: the sensor task logs an error and stops. No value reaches the `Watch`, so the three readers wait in `receiver.get().await` and use no processor time. The buttons, the LED and the Wi-Fi tasks continue.
+
+In a C program built around global state, an SD card error can damage a shared buffer, and a network timeout in the main loop freezes the display. Here an error stays inside the task that has it.
+
+This isolation covers errors, not time. A task that holds the processor without an `.await` still delays all the others.
 
 ## C vs Rust: Multi-Task Architecture
 
 <InArticleAd />
 
-
-The equivalent system in C would typically use FreeRTOS with 6 tasks. Here is what that looks like:
+The same system in C would usually be FreeRTOS with 6 tasks:
 
 ```c title="C with FreeRTOS (6 tasks, shared globals, mutexes)"
 // Shared global state: requires mutex protection
@@ -1430,7 +1453,7 @@ void display_task(void *params) {
 // No shared mutable globals. No mutexes. No lock ordering.
 // Each task owns its peripherals exclusively.
 
-static SENSOR_DATA: Watch<CriticalSectionRawMutex, SensorData, 2> = Watch::new();
+static SENSOR_DATA: Watch<CriticalSectionRawMutex, SensorData, 3> = Watch::new();
 
 #[embassy_executor::task]
 async fn sensor_task(mut i2c: I2c<'static, I2C0, Async>) {
@@ -1458,19 +1481,18 @@ Key differences:
 | Aspect | C + FreeRTOS | Rust + Embassy |
 |--------|-------------|----------------|
 | Task stacks | 6 separate stacks (~12 KB total) | Single stack (async tasks share it) |
-| Data sharing | Global variables + mutexes | Watch channels (zero-copy, lock-free) |
+| Data sharing | Global variables + mutexes | Watch channels (value copied inside a short critical section) |
 | Data races | Possible if you forget a mutex | Impossible (compiler rejects it) |
 | Deadlocks | Possible with wrong lock order | Impossible (no locks) |
 | Peripheral access | Any task can touch any peripheral | Each task owns its peripherals |
 | Error isolation | Corruption can spread through globals | Errors stay within the failing task |
 | Memory safety | Manual (buffer overflows possible) | Compile-time guaranteed |
 
-The Rust version uses less RAM (single stack vs. 6 stacks), has zero risk of data races or deadlocks, and enforces peripheral ownership at compile time. The trade-off is the learning curve: Rust's ownership system takes time to internalize. But once you understand it, the compiler prevents the most common bugs in multi-task embedded systems.
+The Rust version uses less RAM and has no lock to forget or to take in the wrong order, and the compiler checks who owns each peripheral. The cost is the time it takes to learn ownership. One thing the C version does better: FreeRTOS can take the processor from a task that runs too long, and Embassy on one executor cannot.
 
 ## Building and Flashing
 
 <InArticleAd />
-
 
 <Steps>
 1. Build the firmware:
@@ -1496,7 +1518,6 @@ The Rust version uses less RAM (single stack vs. 6 stacks), has zero risk of dat
 
 <InArticleAd />
 
-
 ### Step-by-Step Verification
 
 <Steps>
@@ -1516,10 +1537,11 @@ The Rust version uses less RAM (single stack vs. 6 stacks), has zero risk of dat
 4. **SD card logging.** Insert a FAT32-formatted microSD card before powering on. The yellow LED (GP17) blinks briefly on each write. After running for a minute, power off, remove the SD card, and check `SENSOR.CSV` on a computer:
    ```csv
    sequence,temperature_c,humidity_pct,pressure_pa
-   0,23.45,56.78,101325
-   1,23.46,56.75,101324
+   8,23.45,56.78,101325
+   18,23.46,56.75,101324
    ...
    ```
+   The sequence number rises by about 10 per line, because the sensor task takes 10 readings in the second between two log writes.
 
 5. **Manual publish.** Press button B (GP19). The MQTT task publishes immediately without waiting for the 2-second timer.
 
@@ -1539,19 +1561,22 @@ The Rust version uses less RAM (single stack vs. 6 stacks), has zero risk of dat
 | System panic on boot | Stack overflow | Increase RAM allocation or reduce buffer sizes |
 
 :::tip[Instrument it]
-A sensor hub like this is what a real asset monitor looks like: temperature, vibration, current, and position [read concurrently](/education/sensor-actuator-interfacing-stm32/), each on its own async task so a slow sensor never blocks a fast one. That concurrency is the whole point of monitoring a machine, you watch several signals at once and correlate them, and a temperature rise with a current rise with new vibration is a bearing going. Rust's guarantees keep a hub like this running untended for months, and it can [stream the full picture](https://siliconwit.io) for a machine you cannot babysit.
+A machine monitor has the same shape as this hub: temperature, vibration, current and position are [read side by side](/education/sensor-actuator-interfacing-stm32/), each in its own async task, so a slow sensor never delays a fast one. Signals read together allow a diagnosis: a temperature rise with a current rise and new vibration points to a failing bearing. Any limit that must stop the machine stays in this firmware, where it works without a network. A platform such as [siliconwit.io](https://siliconwit.io) is for oversight, alerts and records of a machine that nobody stands beside.
 :::
 
 ## Production Notes
 
 <InArticleAd />
 
+**Blocking drivers:** The `embedded-sdmmc` and `ssd1306` crates are blocking drivers: their functions return only when the transfer is finished, and they contain no `.await`. While the SD card task writes a block, or the display task sends a frame, no other task runs. At 16 MHz SPI a block write normally takes a few milliseconds. At 400 kHz I2C a full frame of 1024 bytes takes about 23 ms (1024 bytes × 9 bit times ÷ 400,000 per second). The 100 ms sensor loop keeps its pace with both. A slow SD card can hold the executor for longer. If that matters in your product, use async drivers for these two devices.
 
-**Watchdog timer:** For unattended deployment, add a watchdog timer that resets the device if no sensor reading is published for 60 seconds. Embassy-rp provides `embassy_rp::watchdog::Watchdog` for this purpose. Feed the watchdog from the sensor task on each successful read.
+**Published is not received:** The MQTT task publishes at QoS 0, so a reading that leaves the board may never reach a subscriber. The SD card file is the record on the device. If the remote record must be complete, send the missing lines from the file after the connection returns.
 
-**Power consumption:** The Pico W draws approximately 45 mA idle and up to 300 mA during Wi-Fi transmission. With the OLED display active, add about 20 mA. The SD card draws 50 to 100 mA during writes. Total peak: around 470 mA. Use a USB power supply rated for at least 1 A. For battery operation, consider putting the display to sleep between updates and using Wi-Fi power management mode.
+**Watchdog timer:** For a device that runs alone, add a watchdog timer that resets the board if no sensor reading succeeds for 60 seconds. `embassy_rp::watchdog::Watchdog` does this. Feed it from the sensor task after each good read.
 
-**SD card reliability:** The FAT filesystem is not power-fail safe. If power is lost during a write, the filesystem can become corrupted. For critical logging applications, consider writing to a raw partition instead of FAT, or implement a write-ahead log pattern. The `flush_file` call after each write reduces the risk but does not eliminate it.
+**Power consumption:** The Pico W draws about 45 mA idle and up to 300 mA while the radio sends. The OLED adds about 20 mA, and the SD card draws 50 to 100 mA during a write. The peak is near 420 mA, so use a USB supply rated for 1 A or more. On a battery, switch the display off between updates and keep the Wi-Fi power saving mode.
+
+**SD card reliability:** The FAT filesystem is not safe against loss of power. If power fails during a write, the filesystem can be damaged. The `flush_file` call after each write lowers the risk and does not remove it. Where the log is critical, write to a raw partition, or keep a small journal of what is being written.
 
 **Flash wear:** The microSD card has a limited write endurance (typically 100,000 erase cycles per block). Writing every second produces 86,400 writes per day. At this rate, a typical microSD card will last several years, but for decade-long deployments, consider reducing the write frequency or using wear-leveling-aware storage.
 
@@ -1561,39 +1586,38 @@ A sensor hub like this is what a real asset monitor looks like: temperature, vib
 
 <InArticleAd />
 
-
-Over the course of nine lessons, you progressed from blinking an LED to building a complete networked sensor hub, all in Rust on the RP2040.
+The course went from one blinking LED to a networked sensor hub, all in Rust on the RP2040.
 
 ### What You Learned
 
 | Lesson | Skill |
 |--------|-------|
-| 1. Getting Started | Rust toolchain, `no_std`, Embassy project setup, LED blink |
-| 2. GPIO and Interrupts | Digital I/O, pull-ups, debouncing, async edge detection |
-| 3. Timers and PWM | Hardware timers, PWM duty cycle, LED dimming, servo control |
-| 4. ADC and Analog | 12-bit ADC, voltage scaling, sensor reading, DMA transfers |
-| 5. I2C and SPI | Bus protocols, BME280 driver, SSD1306 display, register maps |
-| 6. DMA and PIO | Direct memory access, programmable I/O, WS2812B LED protocol |
-| 7. USB Device | CDC serial, HID keyboard, composite devices, embassy-usb builder |
-| 8. Wi-Fi Networking | CYW43 driver, TCP sockets, MQTT protocol, reconnection logic |
-| 9. Capstone | Multi-task architecture, channels, error isolation, system integration |
+| Rust Toolchain and First Blink | Rust toolchain, probe-rs, `no_std`, rp2040-hal project setup, LED blink with defmt logging |
+| Ownership, Borrowing, and Hardware | Typestate GPIO, button debouncing, `Result` error handling, `Mutex` and critical sections |
+| Timers, PWM, and Interrupts | Hardware timers, servo PWM, interrupts, ADC input, buzzer tones |
+| Embassy Async Fundamentals | Executor, async tasks, timers, channels |
+| I2C and SPI with embedded-hal | embedded-hal traits, BME280 driver, SSD1306 display, bus sharing |
+| UART, DMA, and Ownership | Async UART with DMA, GPS NMEA parsing, buffer ownership |
+| USB Device with embassy-usb | CDC serial, HID keyboard, composite devices |
+| Wi-Fi and Networking (Pico W) | CYW43 driver, TCP sockets, MQTT protocol, reconnection logic |
+| Async Sensor Hub | Multi-task architecture, channels, error isolation, system integration |
 
 ### Key Rust Advantages for Embedded
 
-Throughout this course, you saw how Rust's type system and ownership model solve real embedded programming problems:
+Each of these removed a fault that C lets you write:
 
-- **No null pointer dereferences.** `Option<T>` forces you to handle the "no value" case.
-- **No buffer overflows.** Array bounds are checked at compile time when possible, and at runtime otherwise.
-- **No data races.** The borrow checker prevents two tasks from holding mutable references to the same data.
-- **No use-after-free.** Ownership transfer means resources are always valid when accessed.
-- **No forgotten mutex locks.** There are no mutexes; channels and signals handle inter-task communication.
-- **Peripheral ownership.** Each task owns its hardware peripherals; the compiler rejects code that tries to use a peripheral from the wrong task.
+- `Option<T>` makes you handle the "no value" case, so there is no null pointer to follow.
+- Array bounds are checked, at compile time where possible and at run time otherwise, so a buffer cannot overflow in silence.
+- The borrow checker stops two tasks from holding a mutable reference to the same data, so there are no data races.
+- A value has one owner and is valid as long as it can be reached, so there is no use after free.
+- Each task owns its peripherals, and the compiler rejects code that uses a peripheral from another task.
+- In this project the tasks pass data through a `Watch` and `Signal`s, so there is no mutex to forget.
 
 ### Where to Go Next
 
 <CardGrid>
 <Card title="IoT Systems Course" icon="rocket">
-Take the networking skills from Lessons 8 and 9 further. Build complete IoT deployments with cloud integration, dashboards, and device management. The SiliconWit IoT Systems course covers MQTT brokers, REST APIs, time-series databases, and production deployment patterns.
+Take the Wi-Fi and MQTT skills of the last two lessons further. The SiliconWit IoT Systems course covers MQTT brokers, REST APIs, time-series databases and device management for complete deployments.
 </Card>
 
 <Card title="Edge AI / TinyML Course" icon="rocket">
@@ -1613,12 +1637,9 @@ You have all the building blocks: sensors, displays, storage, networking, and US
 
 <InArticleAd />
 
-
-You built a complete async sensor hub that runs six concurrent tasks on the Pico W using Embassy. A BME280 sensor feeds temperature, humidity, and pressure data through a Watch channel to three consumers: an SSD1306 OLED display, a microSD card logger, and an MQTT publisher. Two buttons cycle the display mode and trigger manual publishes. A status LED indicates Wi-Fi and MQTT connection state. Each task owns its peripherals exclusively, with no shared mutable state, no mutexes, and no risk of data races. The entire system runs on a single stack using cooperative async scheduling, compared to the six separate task stacks and mutex-protected globals required by the equivalent FreeRTOS implementation in C. This capstone demonstrates that Rust's ownership model is not just a safety feature; it is an architectural advantage that produces simpler, more reliable embedded systems.
+The sensor hub runs six tasks on one stack. A BME280 task writes each reading into a `Watch`, and a display, an SD card logger and an MQTT publisher each read the newest value at their own pace, so a slow reader never holds the sensor back and no old reading waits in a queue. Two buttons reach the display and the publisher through `Signal`s. Each task owns its hardware, so no variable has two writers and the program needs no mutex. An error stays in the task that has it: the log continues when the broker is down. One limit remains from the first async lesson: a task that holds the processor without an `.await` delays every other task, and the two blocking drivers here do that for some milliseconds.
 
 <EmbeddedRustRp2040Comments />
-
-
 
 <InArticleAd />
 <TawkWidget />

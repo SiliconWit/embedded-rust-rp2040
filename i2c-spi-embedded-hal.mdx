@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-In C embedded development, every I2C or SPI driver is written for one specific microcontroller. Move from an STM32 to an RP2040, and you rewrite every sensor driver from scratch. Rust solves this with `embedded-hal`, a set of traits that define what an I2C bus or SPI bus can do without specifying how any particular chip implements it. A BME280 driver written against `embedded-hal` traits compiles and runs on an RP2040, an STM32F4, an ESP32, or a Nordic nRF52 without changing a single line. In this lesson you will wire up a BME280 temperature/humidity/pressure sensor over I2C and an SSD1306 OLED display over I2C, then build a weather station that reads the sensor and formats the data on the display, all using Embassy async drivers. #EmbeddedHAL #I2C #WeatherStation
+Your product moves from one microcontroller to another, and every sensor driver must be written and tested again, because in C each driver calls the I2C functions of one vendor by name. Rust removes this work with `embedded-hal`, a set of traits. A trait is a named list of functions that a type promises to have, and the `I2c` trait says what any I2C bus can do without saying how a chip does it. A driver written for the trait runs unchanged on an RP2040, an STM32, an ESP32 or an nRF52. In this lesson you connect a BME280 sensor (temperature, humidity, pressure) and an SSD1306 OLED display to one I2C bus and build a small weather station from two ready-made drivers. #EmbeddedHAL #I2C #WeatherStation
 
 ## What We Are Building
 
 <Card title="Weather Station" icon="star">
-A Raspberry Pi Pico reads temperature, humidity, and barometric pressure from a BME280 sensor over I2C. It formats the readings and displays them on a 128x64 SSD1306 OLED screen (also I2C). Readings update every 2 seconds using an Embassy async task. The system also prints readings over USB serial for data logging.
+A Raspberry Pi Pico reads temperature, humidity and air pressure from a BME280 sensor and shows them on a 128x64 SSD1306 OLED display. Both devices are on the same I2C bus. A new reading appears every 2 seconds and is also logged over defmt RTT. The project uses Embassy, the async framework from [Embassy Async Fundamentals](/education/embedded-rust-rp2040/embassy-async-fundamentals/), and its HAL for the RP2040, `embassy-rp`.
 </Card>
 
 **Project specifications:**
@@ -42,8 +42,8 @@ A Raspberry Pi Pico reads temperature, humidity, and barometric pressure from a 
 | I2C Bus | I2C0, 400 kHz |
 | I2C Pins | SDA = GP4, SCL = GP5 |
 | Update Rate | Every 2 seconds |
-| Serial Output | USB CDC or defmt-rtt |
-| Framework | Embassy (embassy-rp, async I2C) |
+| Log Output | defmt over RTT (through the debug probe) |
+| Framework | Embassy (embassy-rp; blocking I2C in the project, async I2C shown after it) |
 
 ### Bill of Materials
 
@@ -53,11 +53,24 @@ A Raspberry Pi Pico reads temperature, humidity, and barometric pressure from a 
 | 2 | BME280 breakout module | 1 | I2C address 0x76 or 0x77 (check your board) |
 | 3 | SSD1306 OLED 128x64 module | 1 | I2C interface, 0.96 inch |
 | 4 | Breadboard + jumper wires | 1 set | |
-| 5 | USB Micro-B cable | 1 | For programming and serial |
+| 5 | USB Micro-B cable | 1 | Power for the Pico (flashing and logs go through the debug probe) |
 
 ### Wiring Table
 
-Both the BME280 and SSD1306 share the same I2C bus. They have different addresses, so they coexist on the same two wires.
+An I2C bus has two wires: SDA carries the data and SCL carries the clock. Every device on the bus has an address, and the Pico names the address at the start of each transfer, so the BME280 (0x76) and the SSD1306 (0x3C) can share the two wires.
+
+```text
+           3.3 V
+            │  │    pull-up resistors
+            R  R    (on the modules)
+  GP4 SDA ──┴──┼──────┬───────────┬────
+  GP5 SCL ─────┴──────┼──┬────────┼──┬─
+                      │  │        │  │
+                   ┌──┴──┴──┐  ┌──┴──┴──┐
+                   │ BME280 │  │SSD1306 │
+                   │  0x76  │  │  0x3C  │
+                   └────────┘  └────────┘
+```
 
 | Pico Pin | GPIO | Connection | Notes |
 |----------|------|------------|-------|
@@ -66,16 +79,16 @@ Both the BME280 and SSD1306 share the same I2C bus. They have different addresse
 | Pin 36 | 3V3(OUT) | BME280 VIN, SSD1306 VCC | 3.3V supply |
 | Pin 38 | GND | BME280 GND, SSD1306 GND | Common ground |
 
-Most BME280 and SSD1306 breakout boards include pull-up resistors on SDA and SCL. If you have bare modules without pull-ups, add 4.7K ohm resistors from SDA to 3.3V and from SCL to 3.3V.
+Most BME280 and SSD1306 breakout boards have pull-up resistors on SDA and SCL. If yours have none, add 4.7K ohm resistors from SDA to 3.3V and from SCL to 3.3V.
 
 ## The embedded-hal Trait System
 
 <InArticleAd />
 
 
-The `embedded-hal` crate defines traits (interfaces) for common hardware operations. It does not contain any implementation code. Think of it as a contract: "any type that implements `I2c` must provide a `write`, `read`, and `write_read` method with these signatures."
+A wall socket is a standard: any appliance with the right plug works in any socket, whatever power station is behind the wall. `embedded-hal` is the socket standard for peripherals. It contains no working code, only traits: lists of functions with fixed names and types. The HAL for a chip promises "my I2C type has these functions". A driver says "give me any type that has these functions". Unlike a plug, the match is checked by the compiler.
 
-The core I2C trait (simplified) looks like this:
+The `I2c` trait, simplified:
 
 ```rust
 // From embedded-hal (v1.0)
@@ -93,7 +106,13 @@ pub trait I2c {
 }
 ```
 
-And the SPI trait:
+Three things in it are new for a C reader:
+
+- `type Error;` lets each chip name its own error type. The functions return it inside a `Result`.
+- `&[u8]` is a slice: a pointer and a length that travel together. There is no separate length argument to get wrong.
+- `&mut self` means the function borrows the bus with the right to change it, so only one caller can use the bus at a time.
+
+The SPI trait has one function, which runs a list of operations (write, read, transfer) with chip select held active:
 
 ```rust
 pub trait SpiDevice {
@@ -108,14 +127,16 @@ pub trait SpiDevice {
 
 ### How Portability Works
 
+The code has three layers. Your application creates the bus and gives it to the driver. The driver crate (`bme280`) knows the sensor and nothing about any chip. The HAL crate (`embassy-rp`) knows the chip and nothing about any sensor.
+
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 flowchart TD
     subgraph App["Your Application (main.rs)"]
-        MAIN["let mut bme = Bme280::new(i2c, 0x76)"]
+        MAIN["let mut bme = BME280::new_primary(i2c)"]
     end
 
-    subgraph Driver["Driver Crate (bme280-rs)"]
+    subgraph Driver["Driver Crate (bme280)"]
         DRV["fn read_temperature(i2c: &mut impl I2c)"]
     end
 
@@ -132,25 +153,17 @@ flowchart TD
     IMPL -->|"writes to hardware registers"| I2C0
 ```
 
-The architecture has three layers:
-
-| Layer | Example | Role |
-|-------|---------|------|
-| Driver crate | `bme280-rs` | Implements sensor logic using `embedded-hal` traits. Knows nothing about any specific MCU. |
-| HAL crate | `embassy-rp` | Implements `embedded-hal` traits for the RP2040's actual I2C hardware. |
-| Application | Your `main.rs` | Connects the HAL to the driver. |
-
 When you write:
 
 ```rust
-let mut bme = Bme280::new(i2c, 0x76);
+let mut bme = BME280::new_primary(i2c); // I2C address 0x76
 ```
 
-The `Bme280` struct is generic over any type `T` where `T: I2c`. On an RP2040, `T` is `embassy_rp::i2c::I2c`. On an STM32, `T` would be `embassy_stm32::i2c::I2c`. The BME280 driver code is identical in both cases.
+The `BME280` struct is generic: it is written for a type `T` that is not yet known, with the condition `T: I2c` ("T has the functions of the `I2c` trait"). On an RP2040, `T` is `embassy_rp::i2c::I2c`. On an STM32, `T` is `embassy_stm32::i2c::I2c`. The driver code is the same in both cases, and the compiler fills in the real type when it builds your program.
 
 ### The Async Variant: embedded-hal-async
 
-For Embassy, there is `embedded-hal-async`, which defines the same traits but with `async fn` methods. This allows I2C and SPI operations to yield to other tasks while waiting for hardware to complete the transfer, instead of busy-waiting.
+The traits above are blocking: the CPU waits in a loop until the transfer ends. `embedded-hal-async` defines the same traits with `async fn` functions, so that a task can let other tasks run while the hardware finishes the transfer.
 
 ```rust
 // From embedded-hal-async
@@ -168,14 +181,14 @@ pub trait I2c {
 }
 ```
 
-Embassy's `embassy-rp` crate implements both the blocking `embedded-hal::I2c` and the async `embedded-hal-async::I2c` traits.
+`embassy-rp` implements both the blocking and the async `I2c` trait.
 
 ## I2C Configuration with Embassy
 
 <InArticleAd />
 
 
-Setting up I2C on the RP2040 with Embassy requires binding the interrupt handler and configuring the peripheral.
+The async I2C driver works with an interrupt, so you first connect the I2C0 interrupt to Embassy's handler with `bind_interrupts!`. Then you create the bus. The peripheral `p.I2C0` and the two pins are moved into the bus, so no other code can use them by mistake.
 
 ```rust
 use embassy_rp::i2c::{self, Config as I2cConfig, InterruptHandler as I2cInterruptHandler};
@@ -205,12 +218,11 @@ async fn main(_spawner: Spawner) {
 }
 ```
 
-Note the argument order: SCL first, then SDA. This matches the RP2040 hardware initialization sequence.
+Note the argument order: SCL first, then SDA. This is the order that `embassy-rp` defines for its I2C constructors.
 
 ### Scanning the I2C Bus
 
-Before connecting sensors, it is useful to scan the bus for devices. This function tries to read one byte from every possible 7-bit address and reports which ones respond.
-
+When a device does not answer, first find out which addresses are present on the bus. This function tries to read one byte from every valid 7-bit address and reports the ones that answer.
 ```rust
 use embedded_hal_async::i2c::I2c as AsyncI2c;
 
@@ -246,7 +258,7 @@ Address 0x3C is the SSD1306 OLED. Address 0x76 is the BME280 (some boards use 0x
 <InArticleAd />
 
 
-The BME280 is a combined temperature, humidity, and barometric pressure sensor from Bosch. In the Rust ecosystem, several crate options exist. We will use the `bme280` crate, which is written against `embedded-hal` traits.
+The `bme280` crate is a ready driver for the Bosch BME280, written for the `embedded-hal` traits.
 
 ### Project Dependencies
 
@@ -255,7 +267,7 @@ Add these to your `Cargo.toml`:
 ```toml
 [dependencies]
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
+embassy-rp = { version = "0.3", features = ["time-driver", "rp2040", "critical-section-impl"] }
 embassy-time = { version = "0.4", features = ["generic-queue-8"] }
 embassy-sync = "0.6"
 
@@ -277,20 +289,24 @@ embedded-graphics = "0.8"
 # Shared I2C bus (allows multiple devices on one bus)
 embedded-hal-bus = "0.2"
 
+# embedded-hal traits (blocking and async) for the generic helper functions
+embedded-hal = "1.0"
+embedded-hal-async = "1.0"
+
 portable-atomic = { version = "1.10", features = ["critical-section"] }
 static_cell = "2.1"
 ```
 
 ### Reading the BME280
 
-The BME280 requires an initialization sequence: read calibration data from internal registers, configure oversampling, and set the operating mode. The `bme280` crate handles all of this behind the `embedded-hal` traits.
+Before the first reading, the BME280 needs a start sequence: read the calibration data from its registers, set the oversampling, and set the operating mode. `init()` does all of it.
 
 ```rust
 use bme280::i2c::BME280;
 use embassy_time::Delay;
 
 // Create the BME280 driver instance
-// The second argument is the I2C address (0x76 or 0x77)
+// Choose the constructor that matches the I2C address of your board
 let mut bme = BME280::new_primary(i2c);
 // new_primary = 0x76, new_secondary = 0x77
 
@@ -305,11 +321,11 @@ defmt::info!("Humidity:    {} %", measurements.humidity);
 defmt::info!("Pressure:    {} hPa", measurements.pressure / 100.0);
 ```
 
-The `Delay` type from `embassy_time` implements the `embedded-hal::delay::DelayNs` trait, which the BME280 driver needs for timing its measurement cycles.
+The driver must wait while the sensor measures. It does not know how to wait on your chip, so it asks for a second trait, `DelayNs`. The `Delay` type from `embassy_time` has it.
 
 ### How the Same Driver Works on STM32 and ESP32
 
-This is the key insight of `embedded-hal`. The BME280 driver source code contains no RP2040-specific logic. It only uses the `I2c` trait. Here is how the same driver call looks on three different MCUs:
+The source code of the BME280 driver names no chip. It uses only the `I2c` trait. The same driver calls on three microcontrollers:
 
 <Tabs>
 <TabItem label="RP2040 (Embassy)">
@@ -350,18 +366,20 @@ let data = bme.measure(&mut Delay).unwrap(); // Same read
 </TabItem>
 </Tabs>
 
-The only thing that changes is the I2C peripheral initialization (the first line). The BME280 driver code is identical across all three platforms. In C, you would need three completely different driver implementations, each calling platform-specific register manipulation functions.
+Only the line that creates the I2C bus changes. In C you would have three drivers, each built on the I2C functions of one vendor.
 
 ## SSD1306 OLED Display Driver
 
 <InArticleAd />
 
 
-The SSD1306 is a common 128x64 monochrome OLED controller. The `ssd1306` crate provides a driver written against `embedded-hal` traits, and the `embedded-graphics` crate provides drawing primitives (text, shapes, images).
+The `ssd1306` crate is the driver for the display, also written for the `embedded-hal` traits. The `embedded-graphics` crate draws text, shapes and images into a buffer.
 
 ### Sharing the I2C Bus
 
-Both the BME280 and SSD1306 are on the same I2C bus. In Rust, the I2C peripheral is an owned resource. You cannot pass it to two different drivers because that would require two mutable references. The solution is `embedded-hal-bus`, which provides a `RefCellDevice` wrapper that lets multiple drivers share a bus safely.
+Here ownership seems to stand in the way. `BME280::new_primary(i2c)` takes the bus by value, so the bus moves into the sensor driver. If you then pass `i2c` to the display driver, the compiler stops with "use of moved value". It is refusing two owners for one bus, which in C is the fault of two drivers talking at the same moment.
+
+`embedded-hal-bus` gives the answer. You put the bus in a `RefCell`, and each driver gets a `RefCellDevice`, a small handle that borrows the bus only for one transfer. The `RefCell` panics if two handles use the bus at the same moment. That cannot happen here, because both drivers are called from one task, one after the other.
 
 ```rust
 use embedded_hal_bus::i2c::RefCellDevice;
@@ -410,7 +428,9 @@ fn build_display<I: embedded_hal::i2c::I2c>(
 
 ### Drawing Text on the Display
 
-The `embedded-graphics` crate provides a text rendering system. You define a text style (font, color) and draw text at specific positions on the display buffer, then flush the buffer to the hardware.
+You choose a text style (font, color), draw text at a position in the display buffer, and then send the buffer to the display with `flush()`. There is no `printf` and no heap in a `no_std` program, so the numbers are turned into text by hand, in fixed buffers.
+
+One line needs a word: `fn format_f32<'a>(buf: &'a mut [u8; 32], ...) -> &'a str`. The `'a` is a lifetime name. It tells the compiler that the returned text lives inside `buf`, so the caller cannot keep the text after `buf` is gone or changed. The C version returns a `char *` into the buffer, and nothing checks what the caller does with it.
 
 ```rust
 use embedded_graphics::mono_font::ascii::FONT_6X10;
@@ -431,7 +451,7 @@ fn draw_readings<D: DrawTarget<Color = BinaryColor>>(
         .build();
 
     // Clear the display
-    display.clear(BinaryColor::Off).unwrap();
+    let _ = display.clear(BinaryColor::Off);
 
     // Format strings (no_std, so we use fixed buffers)
     let mut temp_buf = [0u8; 32];
@@ -445,19 +465,19 @@ fn draw_readings<D: DrawTarget<Color = BinaryColor>>(
     // Draw each line at a different Y position
     Text::with_baseline(temp_str, Point::new(0, 0), text_style, Baseline::Top)
         .draw(display)
-        .unwrap();
+        .ok();
 
     Text::with_baseline(hum_str, Point::new(0, 16), text_style, Baseline::Top)
         .draw(display)
-        .unwrap();
+        .ok();
 
     Text::with_baseline(pres_str, Point::new(0, 32), text_style, Baseline::Top)
         .draw(display)
-        .unwrap();
+        .ok();
 
     Text::with_baseline("SiliconWit Weather", Point::new(0, 52), text_style, Baseline::Top)
         .draw(display)
-        .unwrap();
+        .ok();
 }
 
 /// Format a floating-point value into a fixed buffer for no_std display.
@@ -482,8 +502,8 @@ fn format_f32<'a>(
         }
     }
 
-    // Write integer part (handle negative)
-    if integer < 0 {
+    // Write integer part (handle negative, including -0.x)
+    if value < 0.0 {
         if pos < buf.len() {
             buf[pos] = b'-';
             pos += 1;
@@ -608,7 +628,7 @@ fn bme280_read_reg<T: I2c>(
 </TabItem>
 </Tabs>
 
-The Rust version uses a generic parameter `T: I2c`, which means "any type that implements the `I2c` trait." The compiler monomorphizes this function for each concrete type, generating platform-specific machine code with zero overhead. You get the abstraction of a virtual interface with the performance of a direct function call.
+For each real type that takes the place of `T`, the compiler builds a separate copy of the function with direct calls to that chip's code (the Rust word is monomorphization). In C the same freedom needs a struct of function pointers and an indirect call each time. Here it costs nothing at run time.
 
 ## Complete Project: Weather Station
 
@@ -648,7 +668,6 @@ use embassy_time::{Delay, Duration, Timer};
 use {defmt_rtt as _, panic_halt as _};
 
 // Display imports
-use ssd1306::mode::BufferedGraphicsMode;
 use ssd1306::prelude::*;
 use ssd1306::rotation::DisplayRotation;
 use ssd1306::size::DisplaySize128x64;
@@ -736,7 +755,7 @@ impl FmtBuf {
         let integer = val as i32;
         let decimal = ((val - integer as f32).abs() * 10.0) as u32;
 
-        if integer < 0 {
+        if val < 0.0 {
             if self.pos < self.buf.len() {
                 self.buf[self.pos] = b'-';
                 self.pos += 1;
@@ -931,7 +950,7 @@ edition = "2021"
 
 [dependencies]
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
+embassy-rp = { version = "0.3", features = ["time-driver", "rp2040", "critical-section-impl"] }
 embassy-time = { version = "0.4", features = ["generic-queue-8"] }
 embassy-sync = "0.6"
 
@@ -961,19 +980,15 @@ codegen-units = 1
 <InArticleAd />
 
 
-The weather station above uses blocking I2C for simplicity. In a multi-task Embassy application, you would want async I2C so that other tasks can run while waiting for a sensor read to complete. Embassy's `embassy-rp` crate provides async I2C through `i2c::I2c::new_async()`.
-
-The key difference:
+The weather station uses blocking I2C, which is enough for one task. In a program with several tasks, a blocking transfer stops all of them until it ends. Async I2C lets the other tasks run during the transfer.
 
 | Aspect | Blocking I2C | Async I2C |
 |--------|-------------|-----------|
 | Constructor | `I2c::new_blocking(...)` | `I2c::new_async(...)` |
-| During transfer | CPU busy-waits | CPU runs other tasks |
-| Requires interrupt | No | Yes (must bind I2C0_IRQ) |
-| Good for single-task | Yes | Overkill |
-| Good for multi-task | Blocks other tasks | Ideal |
+| During transfer | CPU waits in a loop | CPU runs other tasks |
+| Needs an interrupt | No | Yes (bind I2C0_IRQ) |
 
-To convert the weather station to async I2C, change the initialization:
+To change the weather station to async I2C, change how the bus is created:
 
 ```rust
 // Async I2C requires the interrupt binding
@@ -991,14 +1006,14 @@ let i2c = i2c::I2c::new_async(
 );
 ```
 
-Note that the BME280 crate must also support `embedded-hal-async` traits for fully async operation. Check the crate documentation for async support. Many crates in the embedded Rust ecosystem are migrating to support both blocking and async interfaces.
+The driver crate must also support the `embedded-hal-async` traits, or its calls still block. Check the documentation of the crate.
 
 ## SPI Configuration
 
 <InArticleAd />
 
 
-While both devices in this project use I2C, many sensors and displays use SPI. Embassy configures SPI similarly to I2C.
+Many sensors and displays use SPI, a faster bus with a clock line (SCK), one data line in each direction (MOSI and MISO), and a chip select line (CS) for each device. Embassy sets it up in the same way as I2C.
 
 ```rust
 use embassy_rp::spi::{self, Config as SpiConfig, Spi};
@@ -1025,7 +1040,7 @@ let spi = Spi::new_blocking(
 let cs = Output::new(p.PIN_17, Level::High);
 ```
 
-For SPI devices that use the `SpiDevice` trait from `embedded-hal`, you can use `embedded-hal-bus::spi::ExclusiveDevice` to bundle the SPI bus with the chip select pin:
+A driver that asks for the `SpiDevice` trait expects the chip select to be handled for it. `embedded-hal-bus::spi::ExclusiveDevice` joins the SPI bus and the chip select pin into one value that does this:
 
 ```rust
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -1036,7 +1051,7 @@ let spi_device = ExclusiveDevice::new(spi, cs, Delay).unwrap();
 ```
 
 :::tip[Instrument it]
-embedded-hal is how a Rust device talks to the real sensors a monitor is built from: an I2C pressure or temperature sensor, an SPI accelerometer or ADC. The payoff over C is exactly what monitoring needs, a driver that cannot quietly corrupt a buffer or block forever, so a node reading a machine can run untouched for months. Wire the sensor, read it through the trait, and the same code [streams](/education/iot-systems/) to [siliconwit.io](https://siliconwit.io) once you add a radio.
+The sensors of a monitoring device are read through these traits: a pressure or temperature sensor on I2C, an accelerometer or an ADC on SPI. A device that watches a machine must run for months with nobody near it, and a driver that cannot write outside its buffer helps with that. Connect the sensor and read it through the trait. With a radio added, the same code [sends its readings](/education/iot-systems/) to [siliconwit.io](https://siliconwit.io).
 :::
 
 ## Production Notes
@@ -1046,7 +1061,7 @@ embedded-hal is how a Rust device talks to the real sensors a monitor is built f
 
 ### Sensor Calibration
 
-The BME280 contains factory-calibrated compensation coefficients stored in its internal registers. The `bme280` crate reads these during `init()` and applies them to every measurement. The raw ADC values from the sensor are meaningless without this calibration. If you are writing your own driver, be sure to implement the compensation formulas from the Bosch BME280 datasheet (Section 8.1).
+Each BME280 holds correction values from the factory in its registers. The `bme280` crate reads them in `init()` and applies them to every measurement; the raw values mean nothing without them. If you write your own driver, use the compensation formulas of the Bosch datasheet (Section 8.1).
 
 ### I2C Bus Speed Considerations
 
@@ -1056,15 +1071,15 @@ The BME280 contains factory-calibrated compensation coefficients stored in its i
 | Fast | 400 kHz | ~30 cm | Breadboard projects (recommended) |
 | Fast Plus | 1 MHz | ~10 cm | Short PCB traces only |
 
-The RP2040 supports all three modes. For breadboard projects, 400 kHz is the best balance of speed and reliability. If you get intermittent read failures, try reducing to 100 kHz.
+The RP2040 supports all three. On a breadboard, use 400 kHz. If readings fail now and then, go down to 100 kHz.
 
 ### Display Update Strategy
 
-Flushing the entire 128x64 SSD1306 buffer (1 KB) over I2C at 400 kHz takes about 20 ms. If you are updating the display every 2 seconds, this is negligible. For faster update rates, consider partial updates (only redraw changed regions) or SPI connection (which is 10x faster than I2C for bulk data).
+The buffer of a 128x64 display is 1024 bytes. Each byte needs 9 clock periods on the bus (8 data bits and one acknowledge bit), so one `flush()` at 400 kHz takes about 1024 × 9 / 400,000 s = 23 ms. With a new reading every 2 seconds this does not matter. For fast updates, redraw only the part that changed, or use a display on SPI, which is about 10 times faster.
 
 ### Error Handling
 
-The complete project uses `.unwrap()` on many results for clarity. In production code, handle errors explicitly:
+The short examples in this lesson call `.unwrap()` on many results, which panics on any error. In a product, decide what each error means:
 
 ```rust
 match bme.measure(&mut Delay) {
@@ -1109,19 +1124,19 @@ match bme.measure(&mut Delay) {
    Reading #1
    ```
 
-4. Breathe on the BME280 sensor. The temperature and humidity should rise noticeably within 2 to 4 seconds.
+4. Breathe on the BME280 sensor. The temperature and the humidity rise within 2 to 4 seconds.
 
-5. Cover the sensor with your hand (warm, humid air). Temperature should increase, humidity should spike.
+5. Take your breath away and wait. Both values fall back slowly.
 
-6. Check the defmt serial output for matching readings:
+6. Compare with the defmt log lines in the terminal:
    ```
    #1: T=23.4 C, H=45.2 %, P=1013.2 hPa
    #2: T=23.5 C, H=46.1 %, P=1013.2 hPa
    ```
 
-7. If the display shows "Sensor Error!", check the I2C wiring and verify the BME280 address (0x76 vs 0x77). Use the I2C bus scanner to confirm both devices respond.
+7. If the display shows "Sensor Error!", check the wiring, then run the bus scan to see the address of the BME280 (0x76 or 0x77).
 
-8. If nothing appears on the OLED, verify the display address is 0x3C by running the bus scanner.
+8. If the OLED stays dark, run the bus scan and check that 0x3C answers.
 </Steps>
 
 ## Summary
@@ -1129,7 +1144,7 @@ match bme.measure(&mut Delay) {
 <InArticleAd />
 
 
-The `embedded-hal` trait system is what makes Rust embedded drivers reusable across every ARM, RISC-V, and Xtensa microcontroller in the ecosystem. You write a sensor driver once, test it once, and deploy it on any platform. The BME280 and SSD1306 crates we used in this lesson were not written for the RP2040 specifically. They were written against abstract traits, and Embassy's HAL implementation made them work on our Pico without any platform-specific code. In the next lesson, we will explore UART communication with DMA transfers, where Rust's ownership model prevents an entire class of buffer aliasing bugs that plague C firmware.
+A driver written for the `embedded-hal` traits is written once and tested once, and it runs on any chip whose HAL has those traits. The `bme280` and `ssd1306` crates were not written for the RP2040, and they ran on the Pico with no change. One bus served two drivers through `RefCellDevice`, because ownership allows only one owner. The next lesson, [UART, DMA, and Ownership](/education/embedded-rust-rp2040/uart-dma-ownership/), uses the same ownership rules to keep a program away from a buffer while the hardware writes to it.
 
 <EmbeddedRustRp2040Comments />
 

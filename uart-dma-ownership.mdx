@@ -21,11 +21,9 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
   contributors={frontmatter.contributors}
 />
 
-
-
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-DMA (Direct Memory Access) is where embedded C programmers write their most dangerous code. You hand a raw pointer to the DMA controller, start the transfer, and then rely on comments like "do not touch this buffer until DMA is done" to prevent corruption. There is nothing in the C language that enforces this. Rust changes the equation entirely. When you start a DMA transfer, the buffer's ownership moves into the transfer handle. The compiler will reject any attempt to read or write the buffer while DMA is active, not at runtime with a hard fault, but at compile time with a clear error message. In this lesson you will configure UART with DMA on the RP2040, receive NMEA sentences from a GPS module, parse coordinates, and output formatted position data over USB serial. Every buffer interaction is provably safe. #UART #DMA #Ownership
+A GPS position is wrong once a day, and nobody can repeat the fault: the program read a buffer while the hardware was still writing into it. DMA (direct memory access) is hardware that copies bytes between a peripheral and memory with no work from the CPU. In C you give it a pointer to a buffer, and only a comment says "do not touch this buffer until the transfer is done". In Rust the buffer is given or lent to the transfer, and code that touches it too early does not compile. In this lesson you receive position data from a GPS module over a UART with DMA, check it, and turn it into latitude and longitude. #UART #DMA #Ownership
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
@@ -41,7 +39,7 @@ stateDiagram-v2
 ## What We Are Building
 
 <Card title="GPS Coordinate Parser" icon="star">
-A Raspberry Pi Pico receives NMEA sentences from a NEO-6M GPS module over UART with DMA reception. The firmware parses GPRMC and GPGGA sentences to extract latitude, longitude, altitude, speed, and fix quality. Parsed data is formatted and sent over USB serial (or defmt) every second. The DMA reception runs continuously without CPU involvement, and Rust's ownership model guarantees the receive buffer is never accessed during an active transfer.
+A Raspberry Pi Pico receives text lines from a NEO-6M GPS module over a UART, with DMA moving the bytes. The lines follow the NMEA standard and are called sentences. The program reads two kinds, GPRMC and GPGGA, and takes latitude, longitude, altitude, speed and the number of satellites from them. It prints the position over defmt every second, and an LED shows when the module has a fix (a valid position). The receive buffer cannot be touched while a transfer is active, and the compiler checks this.
 </Card>
 
 **Project specifications:**
@@ -52,7 +50,7 @@ A Raspberry Pi Pico receives NMEA sentences from a NEO-6M GPS module over UART w
 | UART | UART0, 9600 baud, 8N1 |
 | UART Pins | TX = GP0, RX = GP1 |
 | DMA | Automatic via Embassy async UART |
-| Output | defmt-rtt or USB CDC serial |
+| Output | defmt over RTT (through the debug probe) |
 | Update Rate | 1 Hz (GPS default output rate) |
 | Framework | Embassy (embassy-rp) |
 
@@ -65,7 +63,7 @@ A Raspberry Pi Pico receives NMEA sentences from a NEO-6M GPS module over UART w
 | 3 | LED (any color) | 1 | GPS fix indicator |
 | 4 | 220 ohm resistor | 1 | LED current limiting |
 | 5 | Breadboard + jumper wires | 1 set | |
-| 6 | USB Micro-B cable | 1 | For programming and serial |
+| 6 | USB Micro-B cable | 1 | Power for the Pico (flashing and logs go through the debug probe) |
 
 ### Wiring Table
 
@@ -78,14 +76,13 @@ A Raspberry Pi Pico receives NMEA sentences from a NEO-6M GPS module over UART w
 | Pin 20 | GP15 | LED anode (through 220 ohm) | Fix indicator |
 | Pin 38 | GND | LED cathode | |
 
-**Important**: The NEO-6M TX connects to the Pico's RX (GP1), and the NEO-6M RX connects to the Pico's TX (GP0). This is a crossover connection. Double-check this, as swapping TX/RX is the most common UART wiring mistake.
+The lines cross: the TX of the NEO-6M goes to the RX of the Pico (GP1), and the RX of the NEO-6M to the TX of the Pico (GP0). TX joined to TX is the most common UART wiring mistake.
 
 ## UART Configuration with Embassy
 
 <InArticleAd />
 
-
-Embassy provides async UART through the `embassy-rp` crate. The async implementation uses DMA internally, so every `read` and `write` call is non-blocking and allows other tasks to run during the transfer.
+The async UART of `embassy-rp` uses DMA inside. A `read` or `write` starts a DMA transfer and then waits at `.await`, and other tasks run until the transfer ends.
 
 ### Basic UART Setup
 
@@ -119,11 +116,11 @@ async fn main(_spawner: Spawner) {
 }
 ```
 
-Notice that the constructor takes DMA channels (`p.DMA_CH0`, `p.DMA_CH1`) as owned parameters. The RP2040 has 12 DMA channels, and Embassy ensures each channel can only be used by one peripheral at a time through the ownership system. Trying to pass `p.DMA_CH0` to both UART and another peripheral would be a compile error.
+The RP2040 has 12 DMA channels. The constructor takes two of them by value (`p.DMA_CH0`, `p.DMA_CH1`), so they move into the UART. If you pass `p.DMA_CH0` to a second peripheral, the program does not compile. In C, two drivers that are given the same channel number fight over it at run time.
 
 ### Splitting TX and RX
 
-For a GPS application, you typically need the RX half in one task (receiving NMEA sentences) and the TX half in another task (or not at all). Embassy lets you split the UART into independent TX and RX halves:
+A GPS program needs the receive half in one task and the transmit half in another task, or not at all. `split()` turns the UART into two values:
 
 ```rust
 let (tx, rx) = uart.split();
@@ -133,16 +130,15 @@ spawner.spawn(gps_receiver_task(rx)).unwrap();
 spawner.spawn(gps_sender_task(tx)).unwrap();
 ```
 
-This split is a zero-cost operation. It moves ownership of the TX and RX hardware into separate handles. The compiler guarantees that no task can accidentally use the wrong half.
+The split costs nothing at run time. Each task owns its half, so no task can use the other half by mistake.
 
 ## Async UART Read and Write
 
 <InArticleAd />
 
-
 ### Reading Bytes
 
-The simplest read fills a buffer and returns when the buffer is full:
+The simplest read fills a buffer and returns when the buffer is full. In the type `UartRx<'static, UART0, uart::Async>`, the word `'static` is a lifetime: it says the value is valid for the whole run of the program. A task may run forever, so everything it is given must live that long.
 
 ```rust
 use embassy_rp::uart::UartRx;
@@ -168,7 +164,7 @@ async fn reader_task(mut rx: UartRx<'static, UART0, uart::Async>) {
 
 ### Reading Until a Delimiter
 
-For NMEA parsing, you want to read until a newline character (`\n`), not until a fixed buffer size. Embassy does not provide a built-in `read_until` for UART, but you can read byte by byte or accumulate into a line buffer:
+A GPS sentence ends with a newline character (`\n`) and its length varies, so a read of a fixed size does not fit. This UART type has no `read_until`, so the function below reads one byte at a time into a line buffer:
 
 ```rust
 /// Read UART bytes into a line buffer until '\n' is found.
@@ -221,12 +217,9 @@ async fn writer_task(mut tx: UartTx<'static, UART0, uart::Async>) {
 
 <InArticleAd />
 
-
-This section explains the fundamental safety property that makes Rust DMA code superior to C DMA code. Understanding this is critical for writing correct firmware.
-
 ### The Problem in C
 
-When you configure a DMA transfer in C, you pass a pointer to a buffer:
+In C, you start a DMA transfer by passing a pointer to a buffer:
 
 ```c
 // C: Start DMA reception into buffer
@@ -244,29 +237,36 @@ memcpy(other_buf, rx_buffer, 256);  // READING PARTIAL DATA!
 printf("%s", rx_buffer);  // UNDEFINED BEHAVIOR!
 ```
 
-The C compiler sees `rx_buffer` as a normal array. It has no concept of "this memory is currently owned by the DMA controller." The only protection is a comment and the programmer's discipline. In a multi-file project with multiple developers, someone will eventually access that buffer at the wrong time. The result is corrupted data, intermittent bugs, or hard faults that only appear under specific timing conditions.
+To the C compiler `rx_buffer` is a normal array. It does not know that the DMA hardware is writing into this memory, so the only protection is a comment. In a project with several files and several people, someone reads the buffer too early, and the result is damaged data that appears only with certain timing.
+
+There is a second fault. If `rx_buffer` is a local variable and the function returns while the transfer still runs, the DMA writes into stack memory that now belongs to another function. The pointer points to data that is gone.
 
 ### The Solution in Rust
 
-In Rust, the DMA transfer takes ownership of the buffer. The buffer literally cannot be accessed until the transfer gives it back.
+In Rust the buffer is a value with one owner, and the transfer takes it. The DMA functions of `rp2040-hal` (`rp2040_hal::dma::single_buffer`) show this most directly. They also ask for a `&'static mut` buffer, one that lives for the whole run of the program, which rules out the second fault:
 
 ```rust
-// Rust: Start DMA reception into buffer
-let rx_buffer = [0u8; 256];
+// Rust (rp2040-hal DMA API): start DMA reception into a buffer.
+// A `&'static mut` buffer is not `Copy`, so passing it by value moves it.
+let rx_buffer: &'static mut [u8; 256] =
+    cortex_m::singleton!(: [u8; 256] = [0; 256]).unwrap();
 
-// The transfer TAKES OWNERSHIP of rx_buffer.
-// After this line, rx_buffer no longer exists in this scope.
-let transfer = rx.read(rx_buffer).await;
+// The transfer TAKES OWNERSHIP of the DMA channel, the UART reader
+// and rx_buffer. After this line, rx_buffer no longer exists in this scope.
+let transfer = single_buffer::Config::new(dma.ch0, uart_rx, rx_buffer).start();
 
 // This would NOT compile:
 // rx_buffer[0] = 0xFF;
-//   error: use of moved value: `rx_buffer`
+//   error[E0382]: use of moved value: `rx_buffer`
 
-// The buffer is returned when the transfer completes.
-// Only then can you access the data.
+// wait() returns the channel, the reader and the buffer when the
+// transfer completes. Only then can you access the data.
+let (ch0, uart_rx, rx_buffer) = transfer.wait();
 ```
 
-With Embassy's async UART, this ownership transfer is implicit in the `.await`. The `read` method borrows the buffer mutably (`&mut buf`), which means no other code can access `buf` while the read is in progress. The `.await` point suspends the task, and when DMA completes, the borrow ends and you can access the buffer again.
+The error E0382, "use of moved value", is the compiler refusing to let you touch memory that the hardware is using. That is good news: the fault that takes weeks to find in C is reported before the program runs, with the line number. The buffer comes back from `wait()`, and only then does the name `rx_buffer` exist again.
+
+With the async UART of Embassy, the same protection comes from a borrow, not a move. `read` borrows the buffer with `&mut buf`, and a `&mut` borrow is exclusive: no other code can use `buf` while it lasts. The task waits at `.await`. When the DMA transfer ends, the borrow ends, and you can read the buffer.
 
 ```rust
 let mut buf = [0u8; 256];
@@ -281,7 +281,7 @@ process_data(&buf);
 
 ### Why This Matters in Practice
 
-Consider a common C pattern with double-buffering:
+Fast data streams use two buffers: the DMA fills one while the program reads the other, and then they change places. In C:
 
 ```c
 // C double-buffer DMA: notoriously bug-prone
@@ -292,14 +292,14 @@ volatile int current_buf = 0;
 void dma_irq_handler() {
     if (current_buf == 0) {
         // Switch DMA to buf_b
-        dma_set_write_addr(dma_chan, buf_b);
+        dma_channel_set_write_addr(dma_chan, buf_b, false);
         current_buf = 1;
         // Process buf_a... but is the main loop also touching buf_a?
     } else {
-        dma_set_write_addr(dma_chan, buf_a);
+        dma_channel_set_write_addr(dma_chan, buf_a, false);
         current_buf = 0;
     }
-    dma_start(dma_chan);
+    dma_channel_start(dma_chan);
 }
 
 // Main loop
@@ -310,16 +310,15 @@ while (1) {
 }
 ```
 
-The `volatile int current_buf` flag is the only synchronization. There is a race condition between the IRQ handler switching buffers and the main loop checking the flag. This bug might work 99% of the time and corrupt data 1% of the time, making it extremely difficult to diagnose.
+The flag `current_buf` is the only coordination. The interrupt can change the buffers between the moment the main loop tests the flag and the moment it reads the buffer. The program works almost always and damages data now and then.
 
-In Rust with Embassy, double-buffering uses channels or swapped owned buffers, and the compiler verifies that each buffer is only accessed by one owner at a time.
+In Rust, each of the two buffers is a value with one owner. The program and the transfer exchange them, and the compiler checks that each buffer has one user at a time.
 
 ## GPS NMEA Sentence Parsing
 
 <InArticleAd />
 
-
-The NEO-6M GPS module outputs NMEA 0183 sentences at 9600 baud, one per line. Each sentence starts with `$`, contains comma-separated fields, and ends with `*XX\r\n` where `XX` is a two-character hexadecimal checksum.
+The NEO-6M sends NMEA 0183 sentences at 9600 baud, one per line. Each sentence starts with `$`, has fields separated by commas, and ends with `*XX\r\n`, where `XX` is a checksum of two hexadecimal characters. The checksum is the XOR of all characters between `$` and `*`. The receiver computes it again, and a sentence with one damaged character is rejected.
 
 ### Common NMEA Sentences
 
@@ -327,16 +326,15 @@ The NEO-6M GPS module outputs NMEA 0183 sentences at 9600 baud, one per line. Ea
 |----------|-------------|------------|
 | GPRMC | Recommended minimum data | Time, status, lat, lon, speed, date |
 | GPGGA | Fix information | Time, lat, lon, fix quality, satellites, altitude |
-| GPVTG | Course over ground | True heading, speed in knots and km/h |
-| GPGSA | Active satellites | Fix type (2D/3D), PDOP, HDOP, VDOP |
-| GPGSV | Satellites in view | Satellite IDs, elevation, azimuth, SNR |
+
+The module also sends GPVTG, GPGSA and GPGSV sentences. The parser ignores them.
 
 ### GPRMC Sentence Format
 
 ```
 $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
-       |      | |         | |         | |     |     |      |     |
-       |      | |         | |         | |     |     |      |     Checksum
+       |      | |         | |         | |     |     |      |       |
+       |      | |         | |         | |     |     |      |       Checksum
        |      | |         | |         | |     |     |      Magnetic var
        |      | |         | |         | |     |     Date (DDMMYY)
        |      | |         | |         | |     Course (degrees)
@@ -347,7 +345,11 @@ $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
        Time (HHMMSS)
 ```
 
+The latitude `4807.038` is not 4807 degrees. The format is DDMM.MMM: two digits of degrees, then minutes. So it means 48 degrees and 07.038 minutes. One degree is 60 minutes, so in decimal degrees it is 48 + 7.038 / 60 = 48.1173 degrees. The longitude has three digits of degrees: `01131.000` is 11 + 31.000 / 60 = 11.5167 degrees.
+
 ### NMEA Parser Implementation
+
+Two things in this code are new. A field is a slice (`&[u8]`), a pointer and a length that point into the line buffer, so no text is copied. And `split_fields<'a>` carries a lifetime name, `'a`: it tells the compiler that the fields point into `data`, so they cannot be used after the line buffer is filled again. In C the same function returns `char *` pointers into the buffer, and nothing stops the caller from reading them after the next line has arrived.
 
 ```rust
 /// Parsed GPS position data
@@ -494,7 +496,7 @@ fn parse_gprmc(line: &[u8], pos: &mut GpsPosition) -> bool {
     // Check fix status
     if fields[2].is_empty() || fields[2][0] != b'A' {
         pos.fix_valid = false;
-        return false;
+        return true; // Report "no fix" to the display task
     }
 
     pos.fix_valid = true;
@@ -634,7 +636,6 @@ fn parse_nmea_float(s: &[u8]) -> f32 {
 
 <InArticleAd />
 
-
 <Tabs>
 <TabItem label="C (Raw Pointers)">
 
@@ -695,7 +696,7 @@ void main_loop() {
 <TabItem label="Rust (Ownership Transfer)">
 
 ```rust
-// Rust DMA UART reception: the buffer is OWNED by the transfer.
+// Rust DMA UART reception: the buffer is BORROWED exclusively by the read.
 // The compiler prevents access during an active transfer.
 
 use embassy_rp::uart::{self, UartRx};
@@ -709,7 +710,7 @@ async fn receiver_task(mut rx: UartRx<'static, UART0, uart::Async>) {
         // During this .await, `buf` cannot be accessed.
         //
         // Attempting to read buf[0] here would be a compile error:
-        //   "cannot use `buf` because it was mutably borrowed"
+        //   "cannot use `buf[_]` because it was mutably borrowed"
         //
         // This is not a runtime check. This is not a flag.
         // This is the compiler proving your code is correct.
@@ -728,20 +729,19 @@ async fn receiver_task(mut rx: UartRx<'static, UART0, uart::Async>) {
 // Attempting to share the buffer with another task:
 // let shared = &buf;
 // spawner.spawn(other_task(shared));
-//   error: `buf` does not live long enough
-//   error: cannot borrow `buf` as immutable because it is
-//          also borrowed as mutable
+//   error[E0597]: `buf` does not live long enough
+//   error[E0502]: cannot borrow `buf` as mutable because it is
+//          also borrowed as immutable
 ```
 
 </TabItem>
 </Tabs>
 
-The C version relies on a `volatile bool` flag and programmer discipline. The Rust version uses the type system to make buffer aliasing during DMA literally impossible to express in the language. This is not a style preference; it eliminates an entire category of bugs that cost embedded teams weeks of debugging.
+The C version depends on a `volatile bool` flag and on every programmer reading the comment. In the Rust version, a second user of the buffer during the transfer cannot be written. The two errors at the end of the Rust tab say why. E0597, "does not live long enough", refuses a pointer to data that will be gone: `buf` is a local variable of this task, and the other task may run longer. E0502 refuses a reader while a writer holds the buffer.
 
 ## Complete Project: GPS Coordinate Parser
 
 <InArticleAd />
-
 
 ### Project Structure
 
@@ -758,6 +758,8 @@ The C version relies on a `volatile bool` flag and programmer discipline. The Ru
 </FileTree>
 
 ### Full Source Code
+
+The program has two tasks. The receiver task reads and parses sentences. The display task prints the position and drives the LED. They do not share a variable. The receiver puts each new position into a `Signal`, a mailbox with one place that always holds the newest value, and the display task waits for it.
 
 ```rust
 // src/main.rs
@@ -945,7 +947,7 @@ fn parse_gprmc(line: &[u8], pos: &mut GpsPosition) -> bool {
 
     if fields[2].is_empty() || fields[2][0] != b'A' {
         pos.fix_valid = false;
-        return false;
+        return true; // Report "no fix" to the display task
     }
 
     pos.fix_valid = true;
@@ -1202,7 +1204,7 @@ edition = "2021"
 
 [dependencies]
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread"] }
-embassy-rp = { version = "0.3", features = ["time-driver", "rp2040"] }
+embassy-rp = { version = "0.3", features = ["defmt", "time-driver", "critical-section-impl", "rp2040"] }
 embassy-time = { version = "0.4", features = ["generic-queue-8"] }
 embassy-sync = "0.6"
 
@@ -1226,14 +1228,19 @@ codegen-units = 1
 
 <InArticleAd />
 
+At higher baud rates, one transfer for each byte wastes time. A ring buffer (circular buffer) is the usual answer: the hardware writes incoming bytes into it without stopping, and when it reaches the end it continues at the start. The program reads behind the write position at its own speed.
 
-For high-throughput UART applications (faster baud rates, continuous data streams), reading byte by byte is inefficient. A circular DMA buffer allows the DMA controller to continuously write incoming bytes into a ring buffer while the CPU reads processed data from behind the write pointer.
-
-In Embassy, the `embassy-rp` crate provides a `RingBufferedUartRx` for this purpose:
+In `embassy-rp`, `BufferedUartRx` gives this ring buffer. It fills the buffer from the UART interrupt, not with DMA. Its `read` function comes from the `embedded_io_async::Read` trait, so add `embedded-io-async = "0.6"` to `Cargo.toml`:
 
 ```rust
-use embassy_rp::uart::BufferedUartRx;
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUartRx};
+use embedded_io_async::Read; // provides rx.read()
 use static_cell::StaticCell;
+
+// The buffered driver needs its own interrupt handler type
+bind_interrupts!(struct Irqs {
+    UART0_IRQ => BufferedInterruptHandler<UART0>;
+});
 
 // Static buffer for the ring buffer (must outlive the UART)
 static RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
@@ -1289,16 +1296,17 @@ async fn buffered_receiver(mut rx: BufferedUartRx<'static, UART0>) {
 }
 ```
 
-The `BufferedUartRx` uses an interrupt-driven ring buffer internally. When bytes arrive at the UART peripheral, the interrupt handler copies them into the ring buffer. Your task reads from the ring buffer at its own pace. If the ring buffer fills up (because your task is too slow), the oldest bytes are overwritten. For GPS at 9600 baud, a 512-byte ring buffer provides over 500 ms of buffer time, which is more than sufficient.
+When bytes arrive, the interrupt handler copies them into the ring buffer, and your task reads them when it is ready. If the task is too slow and the ring buffer fills, the driver stops taking bytes from the UART. When the 32-byte hardware FIFO is also full, new bytes are lost and `read` returns an overrun error.
+
+How long can the task be late? At 9600 baud, one byte takes 10 bits on the wire (a start bit, 8 data bits, a stop bit), so 960 bytes arrive per second. A ring buffer of 512 bytes fills in 512 / 960 = 0.53 s, which is far more than this program needs.
 
 ### Ownership in the Ring Buffer
 
-The ring buffer (`rx_buf`) is passed to `BufferedUartRx::new()` by mutable reference. The `BufferedUartRx` holds an exclusive borrow on this buffer for its entire lifetime. You cannot access `rx_buf` directly while the UART is using it. The interrupt handler writes to the buffer, and your task reads from it through the `BufferedUartRx` API. There is no way to create a data race because the borrow checker prevents direct buffer access.
+`BufferedUartRx::new()` takes the ring buffer `rx_buf` as a `&mut` reference and keeps that exclusive borrow for as long as it exists. So your code cannot reach `rx_buf` directly. The interrupt handler writes into it, your task reads through `BufferedUartRx`, and no third path to the memory can be written.
 
 ## Production Notes
 
 <InArticleAd />
-
 
 ### GPS Cold Start vs Warm Start
 
@@ -1308,11 +1316,11 @@ The ring buffer (`rx_buf`) is passed to `BufferedUartRx::new()` by mutable refer
 | Warm start | 5 to 15 seconds | Recent ephemeris data still valid |
 | Hot start | 1 to 2 seconds | Brief power interruption, all data valid |
 
-The NEO-6M has a backup battery input (VBAT) that keeps its RTC and ephemeris data alive during power-off. If your module has a battery, warm starts are typical. Without a battery, every power cycle is a cold start with up to a minute of waiting for satellites.
+The NEO-6M has a backup battery input (VBAT) that keeps its clock and its satellite orbit data (ephemeris) while the power is off. With a battery, most starts are warm starts. Without one, every power-up is a cold start.
 
 ### Antenna Placement
 
-GPS modules need a clear view of the sky. Indoor testing usually results in no fix or very poor accuracy. For development:
+A GPS module needs a clear view of the sky. Indoors it usually finds no fix, or a poor one. For development:
 
 <Steps>
 1. Place the GPS antenna near a window.
@@ -1323,9 +1331,7 @@ GPS modules need a clear view of the sky. Indoor testing usually results in no f
 
 ### Baud Rate Configuration
 
-The NEO-6M defaults to 9600 baud. You can configure it to higher rates (up to 115200) by sending UBX configuration commands over UART. For NMEA data at 1 Hz update rate, 9600 baud is sufficient (typical NMEA output is about 500 bytes per second).
-
-To change the baud rate, send a UBX-CFG-PRT message:
+The NEO-6M starts at 9600 baud. That is enough for one position per second (about 500 bytes of NMEA text per second). For more, the module accepts up to 115200 baud. You set it with a command in UBX, the binary protocol of the module, sent over the UART:
 
 ```rust
 /// Send UBX command to change NEO-6M baud rate to 115200
@@ -1340,7 +1346,7 @@ async fn set_gps_baudrate(tx: &mut UartTx<'static, UART0, uart::Async>) {
         0x00, 0x00,             // TX ready
         0xD0, 0x08, 0x00, 0x00, // Mode: 8N1
         0x00, 0xC2, 0x01, 0x00, // Baud rate: 115200
-        0x07, 0x00,             // In proto mask: UBX+NMEA
+        0x07, 0x00,             // In proto mask: UBX+NMEA+RTCM
         0x03, 0x00,             // Out proto mask: UBX+NMEA
         0x00, 0x00,             // Flags
         0x00, 0x00,             // Reserved
@@ -1350,11 +1356,11 @@ async fn set_gps_baudrate(tx: &mut UartTx<'static, UART0, uart::Async>) {
 }
 ```
 
-After sending this command, you must also reconfigure the Pico's UART to 115200 baud to continue communication.
+After this command, set the UART of the Pico to 115200 baud too, or the two sides no longer understand each other.
 
 ### Error Recovery
 
-In production GPS firmware, handle these common scenarios:
+A wire comes loose, or noise damages bytes. Count the errors that follow one another, and act when there are too many:
 
 ```rust
 // Retry logic for UART errors
@@ -1382,12 +1388,11 @@ loop {
 
 ### Power Consumption
 
-The NEO-6M draws about 45 mA during acquisition and 35 mA during tracking. If battery life matters, consider using the module's power-save modes via UBX commands, or power-cycling the module through a GPIO-controlled MOSFET, only turning it on when a position update is needed.
+The NEO-6M draws about 45 mA while it searches for satellites and 35 mA while it tracks them. On a battery, use the power-save modes of the module (UBX commands), or switch its supply with a MOSFET on a GPIO pin and power it only when you need a position.
 
 ## Testing
 
 <InArticleAd />
-
 
 <Steps>
 1. Wire the NEO-6M GPS module to the Pico according to the wiring table. Double-check that the TX/RX crossover is correct (Pico GP0 TX to GPS RX, Pico GP1 RX to GPS TX).
@@ -1398,7 +1403,7 @@ The NEO-6M draws about 45 mA during acquisition and 35 mA during tracking. If ba
    cargo run --release
    ```
 
-3. Open the serial monitor. You should immediately see:
+3. The terminal shows the defmt log lines at once:
    ```
    GPS parser starting...
    UART0: TX=GP0, RX=GP1, 9600 baud
@@ -1407,11 +1412,11 @@ The NEO-6M draws about 45 mA during acquisition and 35 mA during tracking. If ba
    GPS display task started
    ```
 
-4. Wait for the GPS module to acquire satellites. The NEO-6M has a small red LED that blinks when it has a fix. During acquisition you will see:
+4. Wait for the GPS module to acquire satellites. The NEO-6M has a small red LED that blinks when it has a fix. During acquisition you will see this line about once per second (the satellite count is taken from GPGGA sentences that carry a fix, so it stays at 0 until the first fix):
    ```
    GPS: waiting for fix... (0 satellites)
-   GPS: waiting for fix... (3 satellites)
-   GPS: waiting for fix... (5 satellites)
+   GPS: waiting for fix... (0 satellites)
+   GPS: waiting for fix... (0 satellites)
    ```
 
 5. Once the module gets a fix (typically 30 to 60 seconds outdoors, may not work indoors), the output changes to:
@@ -1428,7 +1433,7 @@ The NEO-6M draws about 45 mA during acquisition and 35 mA during tracking. If ba
 
 6. The fix indicator LED on GP15 should turn on solid when a valid fix is active.
 
-7. Walk around with the Pico and GPS module. Watch the latitude and longitude change in the serial output. Speed should reflect your movement.
+7. Walk with the Pico and the GPS module. The latitude and longitude change in the log, and the speed follows your movement.
 
 8. If you see no NMEA data at all (no "Parsed N sentences" messages), check:
    - TX/RX wiring (most common issue)
@@ -1440,12 +1445,9 @@ The NEO-6M draws about 45 mA during acquisition and 35 mA during tracking. If ba
 
 <InArticleAd />
 
-
-UART with DMA on the RP2040 demonstrates one of Rust's most practical safety advantages over C. The ownership and borrowing system prevents buffer aliasing during DMA transfers at compile time, eliminating a class of bugs that are notoriously difficult to reproduce and diagnose in C firmware. Embassy's async UART hides the DMA complexity behind clean `read` and `write` calls, while the `BufferedUartRx` provides a high-performance ring buffer for continuous data streams. The GPS parser project shows a complete real-world application: receiving structured data over a serial link, parsing it without heap allocation, and sharing results between tasks using Embassy signals. In the next lesson, we will explore more advanced topics in the Embedded Rust ecosystem.
+A buffer that the hardware is filling must not be touched by the program. C leaves this to a comment. Rust gives the buffer to the transfer, by a move in rp2040-hal or by an exclusive borrow in Embassy, and code that touches it too early does not compile. The async UART of Embassy hides the DMA behind `read` and `write`, and `BufferedUartRx` adds a ring buffer for streams that do not stop. The GPS parser used all of it: it received lines over a serial link, checked and parsed them with no heap, and passed the result from one task to another through a `Signal`. The next lesson is [USB Device with embassy-usb](/education/embedded-rust-rp2040/usb-device-embassy/).
 
 <EmbeddedRustRp2040Comments />
-
-
 
 <InArticleAd />
 <TawkWidget />
