@@ -68,11 +68,9 @@ A push button on GP14 switches an LED on GP15, and a second button on GP16 switc
 
 <InArticleAd />
 
-A peripheral should be used by one part of the program at a time. If two parts both send on the UART, their bytes mix. In C you prevent this with discipline and documentation. In Rust the compiler prevents it, with a rule called ownership.
+A peripheral should be used by one part of the program at a time: if two parts both send on the UART, their bytes mix. C relies on discipline and documentation. Rust has the compiler enforce a rule called ownership.
 
-Think of a room with one key. Every value in Rust (a pin, a UART, a buffer) is such a room, and exactly one variable holds its key: the owner. When you assign the value to another variable or pass it to a function, the key goes with it. This is a move, and the old variable cannot be used again. When the owner reaches the end of its scope (the closing brace of its block), the value is dropped: Rust cleans it up.
-
-The compiler checks this while it builds the program, so ownership costs no speed and no memory at run time.
+Think of a room with one key. Every value (a pin, a UART, a buffer) is a room, and exactly one variable, the owner, holds its key. Assigning the value or passing it to a function hands the key over: a move, after which the old variable cannot be used. When the owner reaches the end of its scope (the closing brace of its block), the value is dropped and Rust cleans it up. The check happens at compile time, so ownership costs no speed and no memory at run time.
 
 ### Move Semantics
 
@@ -93,7 +91,7 @@ let led = pins.gpio15.into_push_pull_output();
 //                   ^^^^^^^^^^^ value used here after move
 ```
 
-The method `.into_push_pull_output()` takes ownership of `pins.gpio15` and gives back the output pin `led`. If you use `pins.gpio15` again, the compiler stops with the error "use of moved value" (E0382) and points to both lines: where the value moved, and where you used it after that. The compiler is refusing a second user for one pin. That is good news: it has found, at your desk, the fault that in C appears as a dark LED in the product.
+`.into_push_pull_output()` takes ownership of `pins.gpio15` and gives back the output pin `led`. Use `pins.gpio15` again and the compiler stops with "use of moved value" (E0382), pointing to where the value moved and where you used it after. It refuses a second user for one pin: at your desk, the fault that in C appears as a dark LED in the product.
 
 ### Why This Matters for Hardware
 
@@ -118,7 +116,7 @@ In Rust this program cannot be written. Module A owns the pin, so module B has n
 
 <InArticleAd />
 
-Ownership settles who may use a pin. A second C fault remains: a pin used in the wrong state, such as a write to a pin that is still an input. The typestate pattern puts the state of the pin into its type. An unconfigured pin, an output pin and an input pin are three types, each with only the functions that make sense for it. Each arrow in the diagram is a function that takes the pin in one type and returns it in another.
+Ownership settles who may use a pin. A second C fault remains: a pin used in the wrong state, such as a write to a pin that is still an input. The typestate pattern makes an unconfigured pin, an output pin and an input pin three types, each with only the functions that make sense for it. Each arrow in the diagram is a function that takes the pin in one type and returns it in another.
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
@@ -174,7 +172,7 @@ raw_pin.set_high();  // COMPILE ERROR: set_high() not defined
                       // for FunctionNull pins
 ```
 
-In each case the compiler reports that the function does not exist for this type of pin. It is refusing an operation that the hardware, in its present state, cannot do. In C all three compile, and the pin does nothing or does the wrong thing.
+In each case the compiler reports that the function does not exist for this type of pin: the hardware, in its present state, cannot do it. In C all three compile, and the pin does nothing or the wrong thing.
 
 ### Reconfiguring Pins
 
@@ -291,7 +289,7 @@ int status = i2c_read(I2C0, addr, buf, len);
 gpio_put(15, 1);  // What if pin 15 is not initialized? No indication.
 ```
 
-In Rust, a function that can fail returns `Result<T, E>`. It holds either `Ok(value)`, where the value has type `T`, or `Err(error)`, where the error has type `E`. The value is inside the `Result`, so you cannot reach it without deciding what to do about the error. If you ignore a `Result`, the compiler warns you. The usual tool is `match`, a `switch` that must cover every case:
+In Rust, a function that can fail returns `Result<T, E>`: either `Ok(value)` of type `T` or `Err(error)` of type `E`. The value is inside, so you cannot reach it without deciding what to do about the error, and an ignored `Result` gives a compiler warning. The usual tool is `match`, a `switch` that must cover every case:
 
 ```rust
 // Rust: the compiler tracks error handling
@@ -340,9 +338,9 @@ fn spi_transfer<S: SpiDevice>(spi: &mut S, data: &[u8], buf: &mut [u8])
 
 <InArticleAd />
 
-If every call moved the key, you could use a pin only once. So the owner can lend a value: the function gets a reference (a borrow), and the owner still has the value when the function returns. A reference is a pointer that the compiler has checked. It is never NULL, and it cannot outlive the value it points to. The span in which a reference is valid is its lifetime. In C you can return a pointer to a local variable, and it then points to stack memory that is gone. Rust does not compile that function.
+If every call moved the key, you could use a pin only once. So the owner can lend a value, like a library book that must come back: the function gets a reference (a borrow), and the owner still has the value when it returns. A reference is a pointer the compiler has checked: never NULL, and it cannot outlive the value it points to. The span in which it is valid is its lifetime. In C you can return a pointer to a local variable whose stack memory is gone; Rust does not compile that function.
 
-One rule covers the two kinds of reference: at any moment a value has either any number of readers or exactly one writer.
+One rule covers the two kinds of reference: at any moment a value has either any number of readers or exactly one writer, never both.
 
 ### Immutable References (`&T`)
 
@@ -413,9 +411,9 @@ int main(void) {
 }
 ```
 
-The interrupt can fire between the test of `flag` and the read of `counter`, so the two values do not belong together. This is a data race. `volatile` only makes the compiler read the variable from memory each time. It does not keep the interrupt out.
+The interrupt can fire between the test of `flag` and the read of `counter`, so the two values do not belong together: a data race. `volatile` only makes the compiler read the variable from memory each time; it does not keep the interrupt out.
 
-In Rust a global variable is a `static`, and one that can change is a `static mut`. Any code can reach a `static mut` at any moment, which breaks the rule of one writer, so the compiler accepts it only inside an `unsafe` block. `unsafe` marks code where the compiler cannot check the rules and you promise that you have checked them yourself. The safe way needs no such promise.
+In Rust a global variable is a `static`, and one that can change is a `static mut`. Any code can reach a `static mut` at any moment, which breaks the rule of one writer, so the compiler accepts it only inside `unsafe`: code where the compiler cannot check the rules and you promise you have. The safe way needs no such promise.
 
 ### The Safe Pattern: Mutex with Critical Section
 

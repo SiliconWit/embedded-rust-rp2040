@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-A first program in a new language on a new chip often costs a day before any LED lights: the compiler builds for the wrong processor, the linker does not know where the chip's memory is, and nothing reaches the board. This lesson removes that day. You install the Rust tools, create a project for the RP2040 (the microcontroller on the Raspberry Pi Pico), and load a program that blinks an LED and prints log lines in your terminal. You also meet the first Rust rule that surprises a C programmer: a pin is a value, and only one part of the program can hold it. Every later project in the course uses the same files and commands. #EmbeddedRust #RP2040 #Toolchain
+A first program in a new language on a new chip often costs a day before any LED lights: the compiler builds for the wrong processor, the linker does not know where the chip's memory is, and nothing reaches the board. This lesson removes that day. You install the Rust tools, create a project for the RP2040 (the microcontroller on the Raspberry Pi Pico), and load a program that blinks an LED and prints log lines. You also meet the first Rust rule that surprises a C programmer: a pin is a value, and only one part of the program can hold it. Every later project in the course uses the same files and commands. #EmbeddedRust #RP2040 #Toolchain
 
 ## What We Are Building
 
 <Card title="Blinking LED with defmt RTT Logging" icon="star">
-An LED that blinks once per second (1 Hz) on the Raspberry Pi Pico. Each time the LED changes, the program prints its state and a cycle counter in your terminal. The log lines travel through the debug probe by RTT (Real-Time Transfer: the probe reads a small buffer in the chip's RAM, so no UART pin is used). The logging library is called defmt. When the LED blinks and the lines appear, every tool in the chain works.
+An LED that blinks once per second (1 Hz) on the Raspberry Pi Pico. Each time it changes, the program prints its state and a cycle counter in your terminal with the defmt library, through the debug probe by RTT (Real-Time Transfer: the probe reads a small buffer in the chip's RAM, so no UART pin is used). When the LED blinks and the lines appear, every tool in the chain works.
 </Card>
 
 **Project specifications:**
@@ -71,7 +71,7 @@ A debug probe is a small adapter between your computer and the chip. It loads th
 
 <InArticleAd />
 
-Your computer and the RP2040 have different processors: the RP2040 has an ARM Cortex-M0+ core. So the compiler must cross-compile, which means it runs on one processor and produces code for another. You install the compiler, a target (the description of the processor to build for), and a tool that speaks to the debug probe.
+The RP2040 has an ARM Cortex-M0+ core, not the processor in your computer, so the compiler must cross-compile: run on one processor and produce code for another. You install the compiler, a target (the description of the processor to build for), and a tool that speaks to the debug probe.
 
 <Tabs>
 <TabItem label="Linux (Ubuntu/Debian)">
@@ -304,7 +304,7 @@ The file declares three regions:
 
 - `BOOT2` is the first 256 bytes of flash (`0x100`). The RP2040 has no flash inside the chip. It runs code from a separate flash chip on the board, and a small second-stage bootloader in these 256 bytes sets that chip up. The `rp-pico` crate supplies the bootloader (from the `rp2040-boot2` crate).
 - `FLASH` is the rest of the 2 MB, from `0x10000100`: your code and constant data.
-- `RAM` is 256 KB from `0x20000000`: the stack and the variables. The RP2040 has 264 KB of RAM in all; this file uses the main block of 256 KB.
+- `RAM` is 256 KB from `0x20000000`: the stack and the variables. The RP2040 has 264 KB of RAM in all; this file uses the main block of 256 KB. The stack grows down toward the variables as functions call functions, like two people filling one shelf from opposite ends.
 
 ### .cargo/config.toml
 
@@ -494,11 +494,11 @@ fn main() -> ! {
 
 **`let` and `let mut`**: a variable cannot change unless it is declared with `mut`. This is the reverse of C, where you add `const` to forbid a change.
 
-**`pac::Peripherals::take().unwrap()`**: in C, any file can write to any peripheral register, so two modules can configure the same peripheral differently and neither knows. Rust closes this door with ownership: a value has one owner, and only the owner can use it. `take()` gives you the one value that stands for all the peripheral registers. It returns an `Option`, which is either `Some(peripherals)` or `None`. Think of a C pointer that may be NULL, with one difference: the compiler does not let you reach the contents until you say what happens for `None`. The first call returns `Some`, and every later call returns `None`. Here `.unwrap()` says "I am sure it is `Some`; panic if it is not".
+**`pac::Peripherals::take().unwrap()`**: in C, any file can write to any peripheral register, so two modules can configure one peripheral differently and neither knows. Rust uses ownership: a value has one owner, and only the owner can use it. `take()` gives you the one value that stands for all the peripheral registers, as an `Option`: `Some(peripherals)` on the first call, `None` on every later call. An `Option` is like a C pointer that may be NULL, except that the compiler makes you say what happens for `None`. `.unwrap()` says "I am sure it is `Some`; panic if it is not".
 
-**`pins.led.into_push_pull_output()`**: in C, `gpio_put()` on a pin that was never made an output compiles and does nothing. Here the configuration of a pin is part of its type. `pins.led` starts as an unconfigured pin. `into_push_pull_output()` takes that value and gives back a new value of a different type, an output pin, and only that type has `set_high()`. The old `pins.led` cannot be used again. This is the typestate pattern: the state of the hardware is written in the type, so the compiler can refuse a wrong use.
+**`pins.led.into_push_pull_output()`**: in C, `gpio_put()` on a pin that was never made an output compiles and does nothing. In Rust the configuration of a pin is part of its type. `into_push_pull_output()` takes the unconfigured `pins.led` and returns an output pin, the only type with `set_high()`; the old name cannot be used again. This is the typestate pattern: the compiler refuses a wrong use because the hardware state is in the type.
 
-**`set_high().unwrap()`**: `set_high()` returns a `Result`, which is `Ok` if the operation worked and `Err` with a reason if it did not. It is a C error code that the compiler does not let you ignore without saying so. A GPIO write on the RP2040 cannot fail, but the `OutputPin` trait also serves chips where it can (a pin on an I2C port expander), so the return type stays. `unwrap()` takes the `Ok` and panics on an `Err`.
+**`set_high().unwrap()`**: `set_high()` returns a `Result`: `Ok` if it worked, `Err` with a reason if not. It is a C error code that the compiler does not let you ignore silently. A GPIO write on the RP2040 cannot fail, but the `OutputPin` trait also serves pins that can (on an I2C port expander), so the return type stays. `unwrap()` takes the `Ok` and panics on an `Err`.
 
 ## Building and Flashing
 
@@ -608,14 +608,14 @@ loop {
 </TabItem>
 </Tabs>
 
-In C these mistakes compile, and you find them in testing or in the field. In Rust they do not compile. A compiler error costs a minute at your desk. The same mistake in a delivered product costs a visit to the site.
+In C these mistakes compile and appear in testing or in the field; in Rust they do not compile. A compiler error costs a minute at your desk, the same mistake in a delivered product a visit to the site.
 
 ## defmt: Structured Logging for Embedded
 
 <InArticleAd />
 
 
-defmt (deferred formatting) is a logging library for small chips. `printf` stores every format string in the chip's flash and builds the text on the chip. defmt puts only a small index for each message on the chip. The text stays in the ELF file on your computer, and probe-rs joins the two. The program uses less flash, and a log call takes less time.
+defmt (deferred formatting) is a logging library for small chips. `printf` stores every format string in flash and builds the text on the chip. defmt sends only a small index per message and the values; the text stays in the ELF file on your computer, where probe-rs joins them. The program uses less flash, and a log call takes less time.
 
 | Feature | printf (C) | defmt (Rust) |
 |---------|-----------|-------------|
@@ -674,7 +674,7 @@ defmt::info!("Sensor: {}", reading);
   - Embed.toml
 </FileTree>
 
-After a build, two entries are new. `target/` holds everything the compiler produced, and the program itself is the last file in the tree. `Cargo.lock` records the exact version of every crate that was used. Cargo writes it; keep it in version control so that every build uses the same versions.
+After a build, two entries are new. `target/` holds everything the compiler produced; the program is the last file in the tree. `Cargo.lock`, written by Cargo, records the exact version of every crate used: keep it in version control so every build uses the same versions.
 
 ### How the Build Works
 
@@ -705,7 +705,7 @@ After a build, two entries are new. `target/` holds everything the compiler prod
 
 **Watchdog timer:** Delivered firmware should enable the watchdog timer, which restarts a program that hangs. The rp2040-hal `Watchdog` driver supports this.
 
-**Why flip-link:** On Cortex-M the stack normally starts at the top of RAM and grows down toward the variables at the bottom. If it grows too far, it overwrites them and nothing reports it. With the stack at the bottom, an overflow leaves RAM, and the HardFault tells you what happened.
+**Why flip-link:** On Cortex-M the stack normally starts at the top of RAM and grows down toward the variables, and an overflow overwrites them with no report. flip-link puts the stack below the variables, so an overflow leaves RAM and the HardFault tells you what happened.
 </Card>
 
 ## What You Have Learned

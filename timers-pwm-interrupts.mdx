@@ -23,7 +23,7 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-A variable shared between the main loop and an interrupt handler (ISR, interrupt service routine) is the source of the faults that appear once a week and never on the bench. In C you mark the variable `volatile` and hope that the interrupt never arrives at the wrong moment. Rust does not compile a global variable that both sides can change freely, so you must say how it is protected: a critical section, a Mutex, or an atomic type. In this lesson you drive a servo with PWM hardware, read a potentiometer with the ADC, and write a timer interrupt that plays a tone on a buzzer, with the shared data protected in a way the compiler can check. #RP2040 #PWM #Interrupts
+A variable shared between the main loop and an interrupt handler (ISR, interrupt service routine) is the source of the faults that appear once a week and never on the bench. In C you mark it `volatile` and hope the interrupt never arrives at the wrong moment. Rust does not compile a global that both sides can change freely: you must protect it with a critical section, a Mutex, or an atomic type. In this lesson you drive a servo with PWM, read a potentiometer with the ADC, and write a timer interrupt that plays a tone on a buzzer, with the shared data protected in a way the compiler can check. #RP2040 #PWM #Interrupts
 
 ## What We Are Building
 
@@ -77,7 +77,7 @@ The SG90 draws up to 500 mA under load. USB power may cause the Pico to brown ou
 
 A hobby servo reads its target angle from the width of a pulse: 0.5 ms means 0 degrees and 2.5 ms means 180 degrees, repeated every 20 ms. A pulse that is 0.1 ms wrong moves the arm by 9 degrees, so the timing cannot depend on what the program is doing. The PWM hardware makes the pulse with a counter and needs no CPU time.
 
-The RP2040 has 8 PWM blocks, called slices. In each slice a divider slows the system clock, and a 16-bit counter counts from 0 to a top value (wrap) and starts again. Each of the two outputs, A and B, is high while the counter is below its own compare value. So the two outputs of a slice share one frequency and can have different pulse widths.
+The RP2040 has 8 PWM blocks, called slices. In each, a divider slows the system clock and a 16-bit counter counts from 0 to a top value (wrap), then starts again. Outputs A and B are each high while the counter is below their own compare value, so they share one frequency but can have different pulse widths.
 
 ```text
   125 MHz      ┌─────────┐   ┌───────────┐
@@ -711,7 +711,7 @@ INFO  ADC: 4095 | Angle: 180 deg | Servo duty: 2500 | Buzzer half-period: 250 us
 
 <InArticleAd />
 
-The RP2040 has one 64-bit timer that counts microseconds, with 4 alarm registers. An alarm causes an interrupt when the lower 32 bits of the timer equal the alarm value. It fires once, so the handler must set the next alarm itself. An STM32 is different: it has several separate timers, each with a prescaler and an auto-reload register.
+The RP2040 has one 64-bit timer that counts microseconds, with 4 alarm registers. An alarm interrupts when the lower 32 bits of the timer equal its value, and it fires once: the handler must set the next alarm itself, like a kitchen timer you wind again after each ring. An STM32 instead has several separate timers, each with a prescaler and an auto-reload register.
 
 | Feature | RP2040 Timer | STM32 General-Purpose Timer |
 |---------|-------------|---------------------------|
@@ -723,7 +723,7 @@ The RP2040 has one 64-bit timer that counts microseconds, with 4 alarm registers
 
 ### Why We Use Both Timer and PWM
 
-On the RP2040 the timer and the PWM hardware are separate. The servo uses the PWM hardware, because the pulse is then made with no CPU time and no timing error. The buzzer uses a timer alarm interrupt that switches a GPIO pin. A second PWM slice at 50% duty, with a new wrap value for each pitch, would also make the tone, with no CPU time at all. The interrupt is used here because the way it shares data is needed in most real projects.
+On the RP2040 the timer and the PWM hardware are separate. The servo uses PWM: no CPU time and no timing error. The buzzer uses a timer alarm interrupt that switches a GPIO pin. A second PWM slice at 50% duty, with a new wrap value for each pitch, would also make the tone with no CPU time; the interrupt is used here because its way of sharing data is needed in most real projects.
 
 ## Interrupt Safety Deep Dive
 
@@ -737,7 +737,7 @@ unsafe {
 }
 ```
 
-`unsafe` marks an operation where the compiler cannot check the rules, and you promise that you have checked them. The NVIC is the interrupt controller of the ARM core, and `unmask` switches one interrupt on. From that line on, the handler can run in the middle of any other code, and it could break a critical section that relies on this interrupt being off. The compiler cannot see whether your shared data is ready for that, so it asks you to say so. The `unsafe` block is small on purpose: it shows a reviewer the one line to examine.
+`unsafe` marks an operation the compiler cannot check, where you promise you have. The NVIC is the interrupt controller of the ARM core, and `unmask` switches one interrupt on. From then on the handler can run in the middle of any other code, and could break a critical section that relies on this interrupt being off. The compiler cannot see whether your shared data is ready, so it asks you to say so. The block is small on purpose: it shows a reviewer the one line to examine.
 
 ### The `Option` Pattern for Moving Peripherals into ISRs
 

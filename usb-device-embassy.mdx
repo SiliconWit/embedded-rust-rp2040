@@ -61,7 +61,7 @@ A Pico that the computer sees as one USB device with two functions. The CDC func
 <InArticleAd />
 
 
-USB differs from UART in one way that explains everything else in this lesson: the two sides are not equal. The computer is the host and it starts every exchange. The Pico is a device and it only answers. A device that has data must wait until the host asks for it.
+USB differs from UART in one way that explains the rest of this lesson: the two sides are not equal. The computer is the host and starts every exchange, like a teacher who asks each student in turn. The Pico is a device: it only answers, and with data ready it waits until the host asks.
 
 Four words follow from this:
 
@@ -70,7 +70,7 @@ Four words follow from this:
 - A descriptor is a block of bytes in which the device answers one of those questions: who made you, what are you, which endpoints do you have.
 - A class is an agreed kind of device (serial port, keyboard, storage). The operating system already has a driver for each class, so the device needs no driver of its own.
 
-The RP2040's controller works at USB 1.1 Full Speed (12 Mbit/s). It has 16 endpoint numbers (0 to 15, each usable in the IN and the OUT direction) and 4 kB of RAM for the endpoint buffers. The electrical part (the PHY) is on the chip, so the D+ and D- data lines go from the connector to the chip with only a few passive parts, which the Pico board already has.
+The RP2040's controller works at USB 1.1 Full Speed (12 Mbit/s), with 16 endpoint numbers (0 to 15, each usable IN and OUT) and 4 kB of RAM for endpoint buffers. The PHY (the electrical part) is on the chip, so D+ and D- go from the connector to the chip through only a few passive parts, already on the Pico board.
 
 When you plug the Pico into a host, this happens:
 
@@ -84,7 +84,7 @@ When you plug the Pico into a host, this happens:
 4. The host selects a configuration (usually configuration 1). Now the other endpoints can carry data.
 </Steps>
 
-The `embassy-usb` crate does this for you. You describe the device with a builder (an object that collects the parts in a few calls and then produces the finished device). The library writes the descriptors, gives out the endpoint numbers, and answers the host.
+The `embassy-usb` crate does this for you. You describe the device with a builder (an object that collects the parts in a few calls, then produces the device), and the library writes the descriptors, gives out endpoint numbers and answers the host.
 
 ### USB Descriptor Hierarchy
 
@@ -363,7 +363,7 @@ fn write_u32(buf: &mut [u8], val: u32) -> usize {
 }
 ```
 
-**How it works:** `embassy_usb::Builder` makes the descriptor tree when the program starts. It needs memory to write into, so you give it buffers for the configuration descriptor, the BOS descriptor (Binary Object Store, a second descriptor that newer hosts ask for) and the control endpoint. The buffers are `static`, because the USB task uses them for the whole run. `CdcAcmClass::new()` adds the two CDC interfaces and their three endpoints, and the builder chooses the numbers.
+**How it works:** `embassy_usb::Builder` makes the descriptor tree at startup, in `static` buffers you give it (the USB task uses them for the whole run): for the configuration descriptor, the BOS descriptor (Binary Object Store, a second descriptor that newer hosts ask for) and the control endpoint. `CdcAcmClass::new()` adds the two CDC interfaces and their three endpoints, and the builder chooses the numbers.
 
 The host can ask a question at any moment, so the USB stack needs a task of its own. `usb_task` answers the host during enumeration and afterwards. Your code and the USB task take turns at each `.await`:
 
@@ -376,9 +376,9 @@ The host can ask a question at any moment, so the USB stack needs a task of its 
 <InArticleAd />
 
 
-USB HID (Human Interface Device) is the class for keyboards, mice, gamepads and other input devices. A HID device sends reports: small packets of fixed size that give its state now (which keys are down, how far the mouse moved). It also sends, once, a report descriptor that tells the host what each bit of a report means. This is why a HID device works on every operating system with no driver of its own.
+USB HID (Human Interface Device) is the class for keyboards, mice, gamepads and other input devices. A HID device sends reports, small fixed-size packets that give its state now (which keys are down, how far the mouse moved), and once a report descriptor that tells the host what each bit means. So it works on every operating system with no driver of its own.
 
-A keyboard report says which keys are down at this moment. It does not say "a key was pressed". So one key press needs two reports: one with the key down, and one with no key down. Without the second report the host believes that the key is still held.
+A keyboard report says which keys are down now, not "a key was pressed". One key press therefore needs two reports: key down, then no key down. Without the second the host believes the key is still held.
 
 ### HID Report Descriptor
 

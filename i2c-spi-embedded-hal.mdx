@@ -25,7 +25,7 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedRustRp2040Comments from '../../../../components/embedded-rust-rp2040/EmbeddedRustRp2040Comments.astro';
 
-Your product moves from one microcontroller to another, and every sensor driver must be written and tested again, because in C each driver calls the I2C functions of one vendor by name. Rust removes this work with `embedded-hal`, a set of traits. A trait is a named list of functions that a type promises to have, and the `I2c` trait says what any I2C bus can do without saying how a chip does it. A driver written for the trait runs unchanged on an RP2040, an STM32, an ESP32 or an nRF52. In this lesson you connect a BME280 sensor (temperature, humidity, pressure) and an SSD1306 OLED display to one I2C bus and build a small weather station from two ready-made drivers. #EmbeddedHAL #I2C #WeatherStation
+Your product moves from one microcontroller to another, and every sensor driver must be written and tested again, because in C each driver calls the I2C functions of one vendor by name. Rust removes this work with `embedded-hal`, a set of traits: named lists of functions that a type promises to have. The `I2c` trait says what any I2C bus can do, not how a chip does it, so a driver written for it runs unchanged on an RP2040, an STM32, an ESP32 or an nRF52. In this lesson you connect a BME280 sensor (temperature, humidity, pressure) and an SSD1306 OLED display to one I2C bus and build a small weather station from two ready-made drivers. #EmbeddedHAL #I2C #WeatherStation
 
 ## What We Are Building
 
@@ -86,7 +86,7 @@ Most BME280 and SSD1306 breakout boards have pull-up resistors on SDA and SCL. I
 <InArticleAd />
 
 
-A wall socket is a standard: any appliance with the right plug works in any socket, whatever power station is behind the wall. `embedded-hal` is the socket standard for peripherals. It contains no working code, only traits: lists of functions with fixed names and types. The HAL for a chip promises "my I2C type has these functions". A driver says "give me any type that has these functions". Unlike a plug, the match is checked by the compiler.
+A wall socket is a standard: any appliance with the right plug works in it, whatever power station is behind the wall. `embedded-hal` is the socket standard for peripherals: no working code, only traits, lists of functions with fixed names and types. A chip's HAL promises "my I2C type has these functions"; a driver asks for "any type that has these functions". Unlike a plug, the compiler checks the match.
 
 The `I2c` trait, simplified:
 
@@ -159,7 +159,7 @@ When you write:
 let mut bme = BME280::new_primary(i2c); // I2C address 0x76
 ```
 
-The `BME280` struct is generic: it is written for a type `T` that is not yet known, with the condition `T: I2c` ("T has the functions of the `I2c` trait"). On an RP2040, `T` is `embassy_rp::i2c::I2c`. On an STM32, `T` is `embassy_stm32::i2c::I2c`. The driver code is the same in both cases, and the compiler fills in the real type when it builds your program.
+The `BME280` struct is generic: written for a type `T` not yet known, with the condition `T: I2c` ("T has the functions of the `I2c` trait"). On an RP2040 `T` is `embassy_rp::i2c::I2c`, on an STM32 `embassy_stm32::i2c::I2c`. The driver code is the same; the compiler fills in the real type when it builds your program.
 
 ### The Async Variant: embedded-hal-async
 
@@ -377,9 +377,9 @@ The `ssd1306` crate is the driver for the display, also written for the `embedde
 
 ### Sharing the I2C Bus
 
-Here ownership seems to stand in the way. `BME280::new_primary(i2c)` takes the bus by value, so the bus moves into the sensor driver. If you then pass `i2c` to the display driver, the compiler stops with "use of moved value". It is refusing two owners for one bus, which in C is the fault of two drivers talking at the same moment.
+Here ownership seems to stand in the way. `BME280::new_primary(i2c)` takes the bus by value, so it moves into the sensor driver, and passing `i2c` to the display driver then fails with "use of moved value". The compiler refuses two owners for one bus: in C, the fault of two drivers talking at the same moment.
 
-`embedded-hal-bus` gives the answer. You put the bus in a `RefCell`, and each driver gets a `RefCellDevice`, a small handle that borrows the bus only for one transfer. The `RefCell` panics if two handles use the bus at the same moment. That cannot happen here, because both drivers are called from one task, one after the other.
+`embedded-hal-bus` gives the answer. Put the bus in a `RefCell`, and give each driver a `RefCellDevice`, a handle that borrows the bus for one transfer only. The `RefCell` panics if two handles use the bus at the same moment, which cannot happen here: one task calls both drivers, one after the other.
 
 ```rust
 use embedded_hal_bus::i2c::RefCellDevice;
@@ -430,7 +430,7 @@ fn build_display<I: embedded_hal::i2c::I2c>(
 
 You choose a text style (font, color), draw text at a position in the display buffer, and then send the buffer to the display with `flush()`. There is no `printf` and no heap in a `no_std` program, so the numbers are turned into text by hand, in fixed buffers.
 
-One line needs a word: `fn format_f32<'a>(buf: &'a mut [u8; 32], ...) -> &'a str`. The `'a` is a lifetime name. It tells the compiler that the returned text lives inside `buf`, so the caller cannot keep the text after `buf` is gone or changed. The C version returns a `char *` into the buffer, and nothing checks what the caller does with it.
+One line needs a word: `fn format_f32<'a>(buf: &'a mut [u8; 32], ...) -> &'a str`. The lifetime name `'a` tells the compiler that the returned text lives inside `buf`, so the caller cannot keep it after `buf` is gone or changed. The C version returns a `char *` into the buffer, and nothing checks its use.
 
 ```rust
 use embedded_graphics::mono_font::ascii::FONT_6X10;
@@ -628,7 +628,7 @@ fn bme280_read_reg<T: I2c>(
 </TabItem>
 </Tabs>
 
-For each real type that takes the place of `T`, the compiler builds a separate copy of the function with direct calls to that chip's code (the Rust word is monomorphization). In C the same freedom needs a struct of function pointers and an indirect call each time. Here it costs nothing at run time.
+For each real type in place of `T`, the compiler builds a separate copy of the function with direct calls to that chip's code (monomorphization). In C the same freedom needs a struct of function pointers and an indirect call each time; here it costs nothing at run time.
 
 ## Complete Project: Weather Station
 

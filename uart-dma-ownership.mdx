@@ -237,9 +237,9 @@ memcpy(other_buf, rx_buffer, 256);  // READING PARTIAL DATA!
 printf("%s", rx_buffer);  // UNDEFINED BEHAVIOR!
 ```
 
-To the C compiler `rx_buffer` is a normal array. It does not know that the DMA hardware is writing into this memory, so the only protection is a comment. In a project with several files and several people, someone reads the buffer too early, and the result is damaged data that appears only with certain timing.
+To the C compiler `rx_buffer` is a normal array; it does not know the DMA is writing into it, so the only protection is a comment. In a project with several files and people, someone reads it too early, and the data is damaged only with certain timing.
 
-There is a second fault. If `rx_buffer` is a local variable and the function returns while the transfer still runs, the DMA writes into stack memory that now belongs to another function. The pointer points to data that is gone.
+A second fault: if `rx_buffer` is a local variable and the function returns while the transfer runs, the DMA writes into stack memory that now belongs to another function.
 
 ### The Solution in Rust
 
@@ -264,9 +264,9 @@ let transfer = single_buffer::Config::new(dma.ch0, uart_rx, rx_buffer).start();
 let (ch0, uart_rx, rx_buffer) = transfer.wait();
 ```
 
-The error E0382, "use of moved value", is the compiler refusing to let you touch memory that the hardware is using. That is good news: the fault that takes weeks to find in C is reported before the program runs, with the line number. The buffer comes back from `wait()`, and only then does the name `rx_buffer` exist again.
+Error E0382, "use of moved value", is the compiler refusing to let you touch memory the hardware is using: the fault that takes weeks to find in C, reported with its line number before the program runs. Like a parcel handed to a courier, the buffer comes back only from `wait()`, and only then does the name `rx_buffer` exist again.
 
-With the async UART of Embassy, the same protection comes from a borrow, not a move. `read` borrows the buffer with `&mut buf`, and a `&mut` borrow is exclusive: no other code can use `buf` while it lasts. The task waits at `.await`. When the DMA transfer ends, the borrow ends, and you can read the buffer.
+With the async UART of Embassy, the protection comes from a borrow, not a move. `read` borrows the buffer with `&mut buf`, which is exclusive: no other code can use `buf` while the task waits at `.await`. When the DMA transfer ends, the borrow ends and you can read the buffer.
 
 ```rust
 let mut buf = [0u8; 256];
@@ -310,7 +310,7 @@ while (1) {
 }
 ```
 
-The flag `current_buf` is the only coordination. The interrupt can change the buffers between the moment the main loop tests the flag and the moment it reads the buffer. The program works almost always and damages data now and then.
+The flag `current_buf` is the only coordination. The interrupt can swap the buffers between the main loop's test of the flag and its read, so the program works almost always and damages data now and then.
 
 In Rust, each of the two buffers is a value with one owner. The program and the transfer exchange them, and the compiler checks that each buffer has one user at a time.
 
@@ -1228,7 +1228,7 @@ codegen-units = 1
 
 <InArticleAd />
 
-At higher baud rates, one transfer for each byte wastes time. A ring buffer (circular buffer) is the usual answer: the hardware writes incoming bytes into it without stopping, and when it reaches the end it continues at the start. The program reads behind the write position at its own speed.
+At higher baud rates, one transfer per byte wastes time. The usual answer is a ring buffer (circular buffer): incoming bytes are written without stopping, wrapping from the end back to the start, like a conveyor belt that loops, and the program reads behind the write position at its own speed.
 
 In `embassy-rp`, `BufferedUartRx` gives this ring buffer. It fills the buffer from the UART interrupt, not with DMA. Its `read` function comes from the `embedded_io_async::Read` trait, so add `embedded-io-async = "0.6"` to `Cargo.toml`:
 
@@ -1296,7 +1296,7 @@ async fn buffered_receiver(mut rx: BufferedUartRx<'static, UART0>) {
 }
 ```
 
-When bytes arrive, the interrupt handler copies them into the ring buffer, and your task reads them when it is ready. If the task is too slow and the ring buffer fills, the driver stops taking bytes from the UART. When the 32-byte hardware FIFO is also full, new bytes are lost and `read` returns an overrun error.
+The interrupt handler copies arriving bytes into the ring, and your task reads them when ready. If the task is too slow and the ring fills, the driver stops taking bytes from the UART; once the 32-byte hardware FIFO is also full, new bytes are lost and `read` returns an overrun error.
 
 How long can the task be late? At 9600 baud, one byte takes 10 bits on the wire (a start bit, 8 data bits, a stop bit), so 960 bytes arrive per second. A ring buffer of 512 bytes fills in 512 / 960 = 0.53 s, which is far more than this program needs.
 

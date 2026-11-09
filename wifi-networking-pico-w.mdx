@@ -60,9 +60,9 @@ A Pico W joins a Wi-Fi network, reads temperature, humidity and pressure from a 
 
 <InArticleAd />
 
-The RP2040 has no radio. On the Pico W a second chip, the CYW43439, does the Wi-Fi work. It sits under the metal shield on the board and talks to the RP2040 over an SPI bus on pins GP23, GP24, GP25 and GP29. These four pins do not go to the board header, so Wi-Fi takes none of the pins you use for your own parts.
+The RP2040 has no radio. On the Pico W a second chip under the metal shield, the CYW43439, does the Wi-Fi work, talking to the RP2040 over SPI on GP23, GP24, GP25 and GP29. These pins do not go to the header, so Wi-Fi takes none of the pins you use for your own parts.
 
-One thing changes from the standard Pico: the onboard LED is wired to the CYW43 chip, not to an RP2040 pin. You cannot switch it with a GPIO write. You ask the driver: `control.gpio_set(0, true).await`, where GPIO 0 of the CYW43 is the onboard LED.
+One change from the standard Pico: the onboard LED is wired to the CYW43 chip, not to an RP2040 pin, so no GPIO write switches it. You ask the driver: `control.gpio_set(0, true).await`, where GPIO 0 of the CYW43 is the onboard LED.
 
 ### Pico W vs Standard Pico
 
@@ -437,9 +437,9 @@ async fn resolve_host(stack: embassy_net::Stack<'static>, hostname: &str) {
 
 <InArticleAd />
 
-A sensor node should not need to know who reads its data. MQTT solves this with a server in the middle, the broker. Think of a notice board with named sections. The sensor pins a note in the section `sensors/pico-w/bme280` (it publishes to that topic), and anyone who has asked for that section (a subscriber) gets a copy. The sensor and the reader never meet. MQTT runs over TCP and its packets are small, which suits a microcontroller.
+A sensor node should not need to know who reads its data. MQTT puts a server in the middle, the broker, like a notice board with named sections. The sensor pins a note in the section `sensors/pico-w/bme280` (publishes to that topic), and everyone who asked for that section (a subscriber) gets a copy; sensor and reader never meet. MQTT runs over TCP with small packets, which suits a microcontroller.
 
-The comparison stops at one point: a notice stays on a board, but a subscriber that is offline when a message passes does not get it later.
+The comparison stops at one point: a notice stays on a board, but a subscriber offline when a message passes does not get it later.
 
 ### MQTT Packet Types
 
@@ -626,7 +626,7 @@ enum MqttError {
 }
 ```
 
-`publish` uses QoS 0. QoS (quality of service) is the MQTT word for how hard the two sides try to deliver a message, and level 0 means "send once, ask for no answer". So read the result of `publish` with care. `Ok` means that the bytes were handed to the TCP stack on the board. It does not mean that the broker has them, and it says nothing about a subscriber. Published does not mean received. For a reading that is sent again every 10 seconds, one lost message does little harm, and QoS 0 keeps the code small.
+`publish` uses QoS 0. QoS (quality of service) is the MQTT word for how hard the two sides try to deliver a message, and level 0 means "send once, ask for no answer". So read the result of `publish` with care: `Ok` means the bytes were handed to the TCP stack on the board, not that the broker has them, and nothing about a subscriber. Published does not mean received. For a reading that is sent again every 10 seconds, one lost message does little harm, and QoS 0 keeps the code small.
 
 ## BME280 Sensor Reading
 
@@ -1422,7 +1422,7 @@ fn write_u32_str(buf: &mut [u8], val: u32) -> usize {
 
 ### Reconnection Strategy
 
-A hundred boards that all try again at once, for ever, keep a broker down that is already in trouble. So the outer loop of `main` waits longer after each failure. This is exponential backoff: the wait starts at 1 second and doubles after each failed attempt (1, 2, 4, 8, 16) up to a limit of 30 seconds. A connection that succeeds sets it back to 1 second.
+A hundred boards that all try again at once, for ever, keep a broker down that is already in trouble. So the outer loop of `main` uses exponential backoff: the wait starts at 1 second and doubles after each failed attempt (1, 2, 4, 8, 16) up to a limit of 30 seconds. A successful connection sets it back to 1 second.
 
 The inner loop publishes until a publish or a ping returns an error. Then the outer loop makes a new socket and connects again.
 
@@ -1485,9 +1485,9 @@ async fn start_connection(stack: Stack<'_>) -> Result<(), Error> {
 }
 ```
 
-The C version spreads one connection over three functions, and each callback must arrange the next step. To handle an error or to try again, you keep the progress in global variables and write the state machine by hand.
+The C version spreads one connection over three functions, each callback arranging the next step; for errors and retries you keep progress in global variables and write the state machine by hand.
 
-The Rust version reads from top to bottom. Each `.await` stops the task until the operation is finished and continues at the same line, so the compiler writes the state machine. An error leaves the function through `?`, and trying again is a `loop` with `continue`.
+The Rust version reads from top to bottom. Each `.await` stops the task until the operation finishes and continues at the same line, so the compiler writes the state machine. An error leaves through `?`, and trying again is a `loop` with `continue`.
 
 ## Building and Flashing
 

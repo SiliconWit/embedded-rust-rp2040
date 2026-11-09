@@ -69,7 +69,7 @@ Three Embassy tasks on one Pico board. Task 1 blinks an external LED in one of t
 
 Most of what a microcontroller does is waiting: for a timer, for a button, for a byte from a sensor. The question is what the processor does during a wait, and what it costs in memory to have several waits open at once.
 
-An RTOS (real-time operating system, for example FreeRTOS or Zephyr) answers with one stack per task. A stack is the memory where a function keeps its local variables. The scheduler may stop a task between any two instructions and continue another (this is preemption), so each task needs a private stack that is large enough for its worst case. This works, but it costs RAM: 512 to 2048 bytes of stack for each task, and a kernel heap of 4 KB or more. Three FreeRTOS tasks take 8 to 10 KB.
+An RTOS (real-time operating system, for example FreeRTOS or Zephyr) answers with one stack per task (a stack is the memory where a function keeps its local variables). The scheduler may stop a task between any two instructions and continue another (preemption), so each task needs a private stack large enough for its worst case. That costs RAM: 512 to 2048 bytes of stack per task and a kernel heap of 4 KB or more, so three FreeRTOS tasks take 8 to 10 KB.
 
 Embassy answers in another way. Five words carry the whole idea, and every program from here on uses them:
 
@@ -79,9 +79,9 @@ Embassy answers in another way. Five words carry the whole idea, and every progr
 - A task is an `async fn` that the program has started and that lives for the whole run.
 - The executor is the small loop that owns the processor. To poll a task is to run it until its next `.await`. The executor polls each task that is ready, and when no task is ready it puts the processor to sleep.
 
-Think of one cook with three pots, who stirs a pot, sets a timer for it and moves to the next. The comparison stops at one point: a cook who sees a pot boil over can jump to it, but the executor cannot take the processor from a task. It must wait for that task's next `.await`.
+Think of one cook with three pots, who stirs a pot, sets a timer for it and moves to the next. The comparison stops at one point: a cook can jump to a pot that boils over, but the executor cannot take the processor from a task; it waits for that task's next `.await`.
 
-The memory saving comes from the compiler. It turns each `async fn` into a state machine: a small struct that remembers at which `.await` the task stopped, and only the local variables it still needs after that point. The size of that struct is known at build time, so no task needs a stack of its own.
+The memory saving comes from the compiler, which turns each `async fn` into a state machine: a small struct that remembers at which `.await` the task stopped, and only the local variables still needed after it. Its size is known at build time, so no task needs a stack of its own.
 
 The drawing shows the three tasks of this lesson for two seconds. The button is pressed at 1100 ms and released at 1300 ms.
 
@@ -381,7 +381,7 @@ The type `Output<'static>` contains a new word. `'static` is a lifetime that mea
 7. Return to step 2.
 </Steps>
 
-Note what step 5 does not do: the interrupt marks the task, it does not run the task. If another task holds the processor at that moment, the ready task waits until that one reaches an `.await`. So the price of having no preemption is one rule: never run for long without an `.await`. A loop that calculates for 100 ms makes every other task up to 100 ms late.
+Step 5 marks the task; it does not run it. If another task holds the processor, the ready task waits for that one's next `.await`. So no preemption costs one rule: never run long without an `.await`. A loop that calculates for 100 ms makes every other task up to 100 ms late.
 
 ## Embassy Time: Delays, Timeouts, and Tickers
 
@@ -457,9 +457,9 @@ defmt::info!("Operation took {} ms", elapsed.as_millis());
 
 <InArticleAd />
 
-Two tasks cannot both write one variable freely, and Rust does not let them try. The usual way to pass data is a channel: a queue with a fixed number of places. One task puts messages in and another takes them out in the same order (FIFO, first in, first out). If the queue is full, `send(...).await` waits for a free place. If it is empty, `receive().await` waits for a message. Other tasks run during both waits.
+Two tasks cannot both write one variable freely, and Rust does not let them try. The usual way to pass data is a channel, a queue with a fixed number of places, like a queue at a counter: one task puts messages in, another takes them out in the same order (FIFO, first in, first out). When it is full, `send(...).await` waits for a free place; when empty, `receive().await` waits for a message. Other tasks run during both waits.
 
-The channel is declared `static`. A `static` is a variable that is made once, at a fixed address, and exists for the whole run. That is how two tasks can both reach it, and why it needs no heap.
+The channel is declared `static`: made once, at a fixed address, for the whole run. That is how two tasks can both reach it, and why it needs no heap.
 
 ```rust
 use embassy_sync::channel::Channel;

@@ -97,13 +97,13 @@ The drawing shows the first second. Each task runs for a short time and then wai
  .  the task waits and uses no processor time
 ```
 
-The marks are not all equally short. A sensor read is spread over several short runs, with an `.await` between them. The display and the SD card use drivers that do not await, so the display task holds the processor for about 23 ms each time it draws, and a sensor reading that is due in that time is late. The part Production Notes returns to this.
+The marks are not all equally short. A sensor read is spread over several short runs with an `.await` between them. The display and SD card drivers do not await, so the display task holds the processor for about 23 ms per draw, and a sensor reading due in that time is late. The part Production Notes returns to this.
 
 ### Data Flow
 
-The sensor task makes ten readings a second, and the MQTT task wants one every two seconds. If every reading waited in a queue, the queue would fill and the published values would be old. A `Watch` solves this. It holds one value. Each new reading replaces the one before, so the sensor task never waits for a reader. The display, SD card and MQTT tasks each have a receiver of their own and read the newest value when they are ready for it.
+The sensor task makes ten readings a second; the MQTT task wants one every two seconds. In a queue the readings would pile up and be old when published. A `Watch` holds one value, like a whiteboard written over: each new reading replaces the last, so the sensor never waits for a reader. The display, SD card and MQTT tasks each have their own receiver and read the newest value when ready.
 
-A `Channel` is the other tool, and it is a queue: `send` waits when the queue is full, and each message goes to only one receiver. Use it when no message may be lost. For a measurement, only the newest reading matters.
+A `Channel` is the other tool, a queue: `send` waits when it is full, and each message goes to only one receiver. Use it when no message may be lost. For a measurement, only the newest reading matters.
 
 ```text
             ┌──────────────┐
@@ -161,7 +161,7 @@ Each button connects its GPIO pin to GND, and the code turns on the internal pul
 
 ### Why Two I2C Buses?
 
-The BME280 (address 0x76) and the SSD1306 (address 0x3C) have different addresses, so one bus could carry both. Two buses are used for the sake of ownership. The sensor task owns I2C0 and the display task owns I2C1, and neither waits for the other. On one shared bus the two tasks would need a mutex around every transfer, and a display update of 23 ms would delay the sensor. The RP2040 has two I2C blocks, so the design uses both.
+The BME280 (address 0x76) and the SSD1306 (address 0x3C) have different addresses, so one bus could carry both. Two buses are used for ownership: the sensor task owns I2C0, the display task owns I2C1, and neither waits for the other. On one shared bus every transfer would need a mutex, and a 23 ms display update would delay the sensor. The RP2040 has two I2C blocks, so the design uses both.
 
 ## Project Setup
 
@@ -1382,9 +1382,9 @@ No peripheral belongs to two tasks. The parameters of each task function show wh
 | Button | The two input pins |
 | LED | The green LED |
 
-The data goes through the `Watch`. The sensor task calls `sender.send(data)`, which does not wait. The display, SD card and MQTT tasks each call `receiver.get().await` and get a copy of the newest reading. While the MQTT task waits its 2 seconds, the sensor task writes about 20 readings. The MQTT task gets the last of them and never sees the other 19.
+The data goes through the `Watch`. The sensor task calls `sender.send(data)`, which does not wait; the display, SD card and MQTT tasks each call `receiver.get().await` for a copy of the newest reading. While the MQTT task waits its 2 seconds, the sensor writes about 20 readings; MQTT gets the last and never sees the other 19.
 
-Compare a global variable. A reading has four fields, and a task that copies it could be stopped after two fields while another task writes new ones: half old, half new (a torn read). So a global needs a mutex at every access, and nothing warns you when you forget one. The `Watch` copies the whole value in one protected step, and the only way to the data is through it.
+Compare a global variable. A reading has four fields, and a task copying it could be stopped after two while another task writes new ones: half old, half new (a torn read). So a global needs a mutex at every access, and nothing warns you when one is forgotten. The `Watch` copies the whole value in one protected step, and is the only way to the data.
 
 ### Error Isolation
 
