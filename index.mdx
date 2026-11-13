@@ -104,29 +104,29 @@ Each lesson follows a consistent cycle:
     **Build:** Potentiometer-controlled servo with buzzer. **Parts:** SG90 servo, potentiometer, piezo buzzer.
   </Card>
 
-  <Card title="Lesson 4: I2C, SPI, and embedded-hal Drivers" icon="document">
-    [I2C, SPI, and embedded-hal Drivers](/education/embedded-rust-rp2040/i2c-spi-embedded-hal/). Use embedded-hal traits to interface a BME280 sensor over I2C and an SSD1306 OLED over I2C/SPI. Understand how trait-based drivers enable cross-platform portability.
+  <Card title="Lesson 4: Embassy Async Fundamentals" icon="document">
+    [Embassy Async Fundamentals](/education/embedded-rust-rp2040/embassy-async-fundamentals/). Transition from polling to async/await with Embassy. Understand the executor, async tasks, timers, and channels, with no RTOS heap and no stack for each task.
+    **Build:** Three async tasks on one Pico: an LED blinker, a debounced button, and a serial reporter. **Parts:** Reuse the LED and push button.
+  </Card>
+
+  <Card title="Lesson 5: I2C, SPI, and embedded-hal Drivers" icon="document">
+    [I2C, SPI, and embedded-hal Drivers](/education/embedded-rust-rp2040/i2c-spi-embedded-hal/). Use embedded-hal traits to interface a BME280 sensor and an SSD1306 OLED on one I2C bus. Understand how trait-based drivers enable cross-platform portability.
     **Build:** Environmental sensor dashboard on OLED. **Parts:** BME280, SSD1306 OLED.
   </Card>
 
-  <Card title="Lesson 5: UART, DMA, and Ownership" icon="document">
-    [UART, DMA, and Ownership](/education/embedded-rust-rp2040/uart-dma-ownership/). Parse GPS NMEA sentences over UART, log data to a microSD card over SPI, and use DMA for efficient data movement without CPU polling.
-    **Build:** GPS data logger with SD storage. **Parts:** NEO-6M GPS module, microSD module.
+  <Card title="Lesson 6: UART, DMA, and Ownership" icon="document">
+    [UART, DMA, and Ownership](/education/embedded-rust-rp2040/uart-dma-ownership/). Receive GPS NMEA sentences over UART with DMA moving the bytes, and see how Rust ownership prevents the buffer aliasing bugs common in C DMA code.
+    **Build:** GPS coordinate parser. **Parts:** NEO-6M GPS module.
   </Card>
 
-  <Card title="Lesson 6: Embassy Async Fundamentals" icon="document">
-    [Embassy Async Fundamentals](/education/embedded-rust-rp2040/embassy-async-fundamentals/). Transition from polling to async/await with Embassy. Understand the executor, async tasks, timers, and channels. Rebuild earlier projects as concurrent async tasks.
-    **Build:** Multitask sensor dashboard (async). **Parts:** Reuse existing.
-  </Card>
-
-  <Card title="Lesson 7: Wi-Fi and Networking (Pico W)" icon="document">
-    [Wi-Fi and Networking (Pico W)](/education/embedded-rust-rp2040/wifi-networking-pico-w/). Use embassy-net and the CYW43 driver for Wi-Fi connectivity. TCP sockets, HTTP serving, and MQTT publishing. Build a wireless sensor node.
-    **Build:** Wi-Fi sensor node with MQTT. **Parts:** Pico W (swap from Pico).
-  </Card>
-
-  <Card title="Lesson 8: USB Device with embassy-usb" icon="document">
+  <Card title="Lesson 7: USB Device with embassy-usb" icon="document">
     [USB Device with embassy-usb](/education/embedded-rust-rp2040/usb-device-embassy/). Build USB serial and keyboard devices on the RP2040 with embassy-usb, then combine them into one composite device.
     **Build:** a virtual serial port that reports sensor data, and a USB keyboard that sends a key for each button press. **Parts:** Pico, push buttons, USB cable.
+  </Card>
+
+  <Card title="Lesson 8: Wi-Fi and Networking (Pico W)" icon="document">
+    [Wi-Fi and Networking (Pico W)](/education/embedded-rust-rp2040/wifi-networking-pico-w/). Use embassy-net and the CYW43 driver for Wi-Fi connectivity. TCP sockets, HTTP requests, and MQTT publishing. Build a wireless sensor node.
+    **Build:** Wi-Fi sensor node with MQTT. **Parts:** Pico W (swap from Pico).
   </Card>
 
   <Card title="Lesson 9: Async Sensor Hub Project" icon="document">
@@ -140,7 +140,7 @@ Each lesson follows a consistent cycle:
 | Part | Quantity | First Used | Approximate Cost |
 |------|----------|------------|-----------------|
 | Raspberry Pi Pico | 1 | Lesson 1 | ~4 USD |
-| Raspberry Pi Pico W | 1 | Lesson 7 | ~6 USD |
+| Raspberry Pi Pico W | 1 | Lesson 8 | ~6 USD |
 | Debug probe (Picoprobe or ST-Link V2) | 1 | Lesson 1 | 2-5 USD |
 | Micro USB cable | 2 | Lesson 1 | ~2 USD |
 | Breadboard + jumper wires | 1 set | Lesson 1 | 3-5 USD |
@@ -149,23 +149,22 @@ Each lesson follows a consistent cycle:
 | SG90 micro servo | 1 | Lesson 3 | ~2 USD |
 | Potentiometer (10K) | 1 | Lesson 3 | ~0.25 USD |
 | Piezo buzzer | 1 | Lesson 3 | ~0.50 USD |
-| BME280 sensor module (I2C) | 1 | Lesson 4 | 2-3 USD |
-| SSD1306 OLED display (I2C, 128x64) | 1 | Lesson 4 | 3-4 USD |
-| NEO-6M GPS module | 1 | Lesson 5 | 3-5 USD |
-| MicroSD card module (SPI) | 1 | Lesson 5 | 1-2 USD |
-| MicroSD card (any size) | 1 | Lesson 5 | ~2 USD |
-| WS2812B LED strip (8 pixels) | 1 | Lesson 8 | 2-3 USD |
+| BME280 sensor module (I2C) | 1 | Lesson 5 | 2-3 USD |
+| SSD1306 OLED display (I2C, 128x64) | 1 | Lesson 5 | 3-4 USD |
+| NEO-6M GPS module | 1 | Lesson 6 | 3-5 USD |
+| MicroSD card module (SPI) | 1 | Lesson 9 | 1-2 USD |
+| MicroSD card (any size) | 1 | Lesson 9 | ~2 USD |
 
-**Total estimated cost: 30-45 USD** (including both Pico and Pico W)
+**Total estimated cost: 28-42 USD** (including both Pico and Pico W)
 
 ## Skill Progression
 
-| Skill | Lessons 1-3 | Lessons 4-5 | Lessons 6-7 | Lessons 8-9 |
+| Skill | Lessons 1-3 | Lesson 4 | Lessons 5-6 | Lessons 7-9 |
 |-------|------------|------------|------------|------------|
-| **Rust Concepts** | Ownership, borrowing, typestate, Result | Traits, generics, embedded-hal | Async/await, futures, channels | PIO macros, build scripts, production patterns |
-| **Hardware** | GPIO, PWM, ADC, timers, interrupts | I2C, SPI, UART, DMA | Wi-Fi (CYW43), TCP/MQTT | PIO state machines, flash, watchdog |
-| **Projects** | Blink, button LED, servo | Sensor dashboard, GPS logger | Async dashboard, Wi-Fi node | NeoPixels, production monitor |
-| **Framework** | rp2040-hal (direct HAL) | rp2040-hal + drivers | Embassy async | Embassy + PIO + integration |
+| **Rust Concepts** | Ownership, borrowing, typestate, Result | Async/await, futures, channels | Traits, generics, embedded-hal, buffer ownership | Composite devices, task isolation, error handling across tasks |
+| **Hardware** | GPIO, PWM, ADC, timers, interrupts | GPIO and timers under Embassy | I2C, SPI, UART, DMA | USB, Wi-Fi (CYW43), TCP/MQTT |
+| **Projects** | Blink, button LED, servo | Async blinker, button and reporter | Sensor dashboard, GPS parser | USB serial and keyboard, Wi-Fi node, async sensor hub |
+| **Framework** | rp2040-hal (direct HAL) | Embassy async | embedded-hal drivers on rp2040-hal and Embassy | Embassy (embassy-usb, embassy-net) |
 
 ## Prerequisites
 
